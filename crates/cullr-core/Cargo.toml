@@ -8,8 +8,13 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+walkdir.workspace = true
+rusqlite.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

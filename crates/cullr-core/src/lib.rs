@@ -10,6 +10,24 @@
 //! ```
 //! assert!(!cullr_core::VERSION.is_empty());
 //! ```
+//!
+//! ```
+//! use cullr_core::{scan_folder, ScanOptions};
+//!
+//! // The engine is GUI-free; scanning only needs a filesystem path.
+//! let dir = tempfile::tempdir().unwrap();
+//! std::fs::write(dir.path().join("IMG_0001.CR3"), b"x").unwrap();
+//! let photos = scan_folder(dir.path(), ScanOptions::default()).unwrap();
+//! assert_eq!(photos.len(), 1);
+//! ```
+
+pub mod db;
+pub mod model;
+pub mod scanner;
+
+pub use db::{Db, DbError, now_millis};
+pub use model::{IngestInfo, Label, PhotoEntry, PhotoId, PhotoMeta, PhotoStatus};
+pub use scanner::{ScanError, ScanOptions, scan_folder};
 
 /// Semantic version of the engine, mirroring the crate version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
