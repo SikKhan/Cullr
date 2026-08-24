@@ -34,7 +34,8 @@ pub use db::{Db, DbError, now_millis};
 pub use extract::{ExtractError, extract_file, is_supported_extension};
 pub use ingest::{IngestEvent, IngestPipeline};
 pub use model::{
-    DEFAULT_ASPECT, IngestInfo, Label, PendingPhoto, PhotoEntry, PhotoId, PhotoMeta, PhotoStatus,
+    DEFAULT_ASPECT, IngestInfo, Label, PendingPhoto, PhotoDetail, PhotoEntry, PhotoId, PhotoMeta,
+    PhotoStatus,
 };
 pub use scanner::{ScanError, ScanOptions, scan_folder};
 

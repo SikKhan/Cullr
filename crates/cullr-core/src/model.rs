@@ -194,6 +194,50 @@ impl PhotoEntry {
 /// Aspect ratio assumed for photos whose preview has not been measured yet.
 pub const DEFAULT_ASPECT: f32 = 3.0 / 2.0;
 
+/// A photo row with the full display record the loupe view renders.
+///
+/// [`PhotoEntry`] carries only what a contact-sheet cell needs; the loupe
+/// additionally shows the large preview asset and the EXIF summary, so this
+/// superset is served by [`crate::Db::photo_detail`] on demand.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PhotoDetail {
+    /// Stable row handle used by all subsequent commands.
+    pub id: PhotoId,
+    /// Path of the file relative to its scan root.
+    pub rel_path: PathBuf,
+    /// Color label persisted from previous culling sessions.
+    pub label: Label,
+    /// Current pipeline state of the row.
+    pub status: PhotoStatus,
+    /// Pixel size `(width, height)` of the extracted preview, before any
+    /// orientation rotation is applied; `None` until ingest succeeds.
+    pub pixels: Option<(u32, u32)>,
+    /// EXIF orientation flag (`1..8`); defaults to upright (`1`).
+    pub orientation: u16,
+    /// Cache path of the full-size preview JPEG; `None` until ingest
+    /// succeeds or for rows whose extraction failed.
+    pub preview_path: Option<PathBuf>,
+    /// Cache path of the downscaled thumbnail JPEG.
+    pub thumb_path: Option<PathBuf>,
+    /// Camera make/model string, when EXIF provides one.
+    pub camera: Option<String>,
+    /// Lens designation string, when EXIF provides one.
+    pub lens: Option<String>,
+    /// Capture timestamp formatted for display, when EXIF provides one.
+    pub taken_at: Option<String>,
+    /// Shutter speed formatted for display (e.g. `1/250 s`).
+    pub shutter: Option<String>,
+    /// Aperture as f-number (e.g. `2.8`).
+    pub aperture: Option<f64>,
+    /// ISO sensitivity rating.
+    pub iso: Option<u32>,
+    /// Focal length in millimeters.
+    pub focal_mm: Option<f64>,
+    /// Extraction failure description; `None` unless status is
+    /// [`PhotoStatus::Error`].
+    pub err_msg: Option<String>,
+}
+
 /// A photo row awaiting ingest: its stable id plus the on-disk identity
 /// needed to extract it.
 ///

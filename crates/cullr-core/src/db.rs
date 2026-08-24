@@ -38,7 +38,9 @@ use std::time::{Duration, SystemTime};
 use rusqlite::{Connection, params};
 use thiserror::Error;
 
-use crate::model::{IngestInfo, Label, PendingPhoto, PhotoEntry, PhotoId, PhotoMeta, PhotoStatus};
+use crate::model::{
+    IngestInfo, Label, PendingPhoto, PhotoDetail, PhotoEntry, PhotoId, PhotoMeta, PhotoStatus,
+};
 use crate::scanner::ScanOptions;
 
 /// Schema revision this build understands; bumped with every migration.
@@ -348,6 +350,55 @@ impl Db {
                     1,
                 )?)),
                 None => Ok(None),
+            }
+        })
+    }
+
+    /// Fetches the full display record for one photo (loupe view).
+    ///
+    /// Superset of [`Db::photo_entry`]: adds the large preview asset path
+    /// and the EXIF summary columns. `None` means the id does not exist.
+    pub fn photo_detail(&self, id: PhotoId) -> Result<Option<PhotoDetail>, DbError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT rel_path, label, status, width, height, orientation,
+                        preview_path, thumb_path, camera, lens, taken_at,
+                        shutter, aperture, iso, focal_mm, err_msg
+                 FROM photos WHERE id = ?1",
+            )?;
+            let mut rows = stmt.query([narrow_u64(id.0)])?;
+            match rows.next()? {
+                None => Ok(None),
+                Some(row) => {
+                    let label: i64 = row.get(1)?;
+                    let status: i64 = row.get(2)?;
+                    let width: Option<i64> = row.get(3)?;
+                    let height: Option<i64> = row.get(4)?;
+                    let pixels = width
+                        .and_then(|w| u32::try_from(widen_to_u64(w)).ok())
+                        .zip(height.and_then(|h| u32::try_from(widen_to_u64(h)).ok()));
+                    Ok(Some(PhotoDetail {
+                        id,
+                        rel_path: PathBuf::from(row.get::<_, String>(0)?),
+                        label: Label::from_u8(u8::try_from(label).unwrap_or(0)).unwrap_or_default(),
+                        status: PhotoStatus::from_u8(u8::try_from(status).unwrap_or(0))
+                            .unwrap_or_default(),
+                        pixels,
+                        orientation: u16::try_from(row.get::<_, i64>(5)?).unwrap_or(1),
+                        preview_path: row.get::<_, Option<String>>(6)?.map(PathBuf::from),
+                        thumb_path: row.get::<_, Option<String>>(7)?.map(PathBuf::from),
+                        camera: row.get(8)?,
+                        lens: row.get(9)?,
+                        taken_at: row.get(10)?,
+                        shutter: row.get(11)?,
+                        aperture: row.get(12)?,
+                        iso: row.get::<_, Option<i64>>(13)?.and_then(|iso| {
+                            u32::try_from(widen_to_u64(iso)).ok().filter(|_| iso >= 0)
+                        }),
+                        focal_mm: row.get(14)?,
+                        err_msg: row.get(15)?,
+                    }))
+                }
             }
         })
     }
@@ -1143,6 +1194,61 @@ mod tests {
         assert_eq!(entry.status, PhotoStatus::Error);
         assert_eq!(entry.err_msg.as_deref(), Some("corrupt header"));
         assert_eq!(entry.thumb_path, None);
+    }
+
+    #[test]
+    fn photo_detail_should_return_the_full_loupe_record() {
+        let fx = open_db();
+        let root = fx._dir.path();
+        let scanned = vec![meta(root, "a.nef", 1, 10)];
+        let entries = fx
+            .db
+            .sync_scan(root, &scanned, ScanOptions::default())
+            .expect("sync");
+        fx.db
+            .record_ingest_ok(
+                entries[0].id,
+                &IngestInfo {
+                    width: 6000,
+                    height: 4000,
+                    orientation: 6,
+                    camera: Some("Canon EOS R6".to_owned()),
+                    lens: Some("RF 24-70mm".to_owned()),
+                    taken_at: Some("2026-08-24 10:00:00".to_owned()),
+                    shutter: Some("1/250 s".to_owned()),
+                    aperture: Some(2.8),
+                    iso: Some(400),
+                    focal_mm: Some(35.0),
+                    preview_path: "/cache/previews/x.jpg".into(),
+                    thumb_path: "/cache/thumbs/x.jpg".into(),
+                },
+            )
+            .expect("ingest ok");
+
+        let detail = fx.db.photo_detail(entries[0].id).expect("photo_detail");
+
+        let detail = detail.expect("row exists");
+        assert_eq!(detail.id, entries[0].id);
+        assert_eq!(detail.status, PhotoStatus::Ok);
+        assert_eq!(detail.pixels, Some((6000, 4000)));
+        assert_eq!(detail.orientation, 6);
+        assert_eq!(detail.preview_path, Some("/cache/previews/x.jpg".into()));
+        assert_eq!(detail.camera.as_deref(), Some("Canon EOS R6"));
+        assert_eq!(detail.aperture, Some(2.8));
+        assert_eq!(detail.iso, Some(400));
+        assert_eq!(detail.focal_mm, Some(35.0));
+        // Pending rows keep every ingest-filled column empty.
+        assert_eq!(detail.label, Label::None);
+        assert_eq!(detail.err_msg, None);
+    }
+
+    #[test]
+    fn photo_detail_should_return_none_for_unknown_ids() {
+        let fx = open_db();
+
+        let detail = fx.db.photo_detail(PhotoId(9_999)).expect("photo_detail");
+
+        assert_eq!(detail, None);
     }
 
     #[test]

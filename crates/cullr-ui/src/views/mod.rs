@@ -5,6 +5,7 @@
 
 pub mod grid;
 pub mod home;
+pub mod loupe;
 
 use std::path::PathBuf;
 

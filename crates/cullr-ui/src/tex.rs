@@ -62,6 +62,53 @@ pub enum TextureState {
     Broken,
 }
 
+/// Which rendition of a photo a texture serves (SPEC §5.3 keys textures
+/// by `(PhotoId, SizeClass)`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SizeClass {
+    /// Contact-sheet thumbnail (≤ 512 px long edge).
+    Thumb,
+    /// Loupe-sized full preview.
+    Screen,
+}
+
+/// Cache key: one photo at one size class. Both classes of an id live in
+/// the cache independently — a grid thumb says nothing about loupe state.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TexKey {
+    /// Photo this texture belongs to.
+    pub id: PhotoId,
+    /// Rendition requested.
+    pub class: SizeClass,
+}
+
+impl TexKey {
+    /// Key for a contact-sheet thumbnail.
+    pub fn thumb(id: PhotoId) -> Self {
+        Self {
+            id,
+            class: SizeClass::Thumb,
+        }
+    }
+
+    /// Key for a loupe screen preview.
+    pub fn screen(id: PhotoId) -> Self {
+        Self {
+            id,
+            class: SizeClass::Screen,
+        }
+    }
+
+    /// Texture-name prefix so both classes of an id coexist in the GPU
+    /// texture registry without colliding.
+    fn class_prefix(self) -> &'static str {
+        match self.class {
+            SizeClass::Thumb => "thumb",
+            SizeClass::Screen => "screen",
+        }
+    }
+}
+
 /// Tunables; production values come from [`Textures::new`], tests shrink
 /// them to make eviction, upload caps and backlog drops deterministic.
 struct Limits {
@@ -106,13 +153,13 @@ struct Pending {
 }
 
 struct Job {
-    id: PhotoId,
+    key: TexKey,
     path: PathBuf,
     ticket: u64,
 }
 
 struct Decoded {
-    id: PhotoId,
+    key: TexKey,
     path: PathBuf,
     image: Result<egui::ColorImage, String>,
 }
@@ -124,10 +171,10 @@ struct Decoded {
 /// ends and the shared epoch counter. `handle` is called per visible cell
 /// per frame and stays O(1) apart from request dispatch.
 pub struct Textures {
-    slots: HashMap<PhotoId, Slot>,
-    pending: HashMap<PhotoId, Pending>,
+    slots: HashMap<TexKey, Slot>,
+    pending: HashMap<TexKey, Pending>,
     ready: VecDeque<Decoded>,
-    broken: HashMap<PhotoId, PathBuf>,
+    broken: HashMap<TexKey, PathBuf>,
     demand_tx: Sender<Job>,
     prefetch_tx: Sender<Job>,
     decoded_rx: Receiver<Decoded>,
@@ -135,9 +182,9 @@ pub struct Textures {
     /// skip superseded jobs. Relaxed ordering suffices — correctness never
     /// relies on the ticket alone, `sync` re-validates against `pending`.
     epoch: Arc<AtomicU64>,
-    /// Visible ids of the previous `focus` call; change detection gates
+    /// Visible keys of the previous `focus` call; change detection gates
     /// epoch bumps so a static sheet costs nothing.
-    last_focus: Vec<PhotoId>,
+    last_focus: Vec<TexKey>,
     limits: Limits,
     frame: u64,
     bytes: usize,
@@ -186,51 +233,51 @@ impl Textures {
         }
     }
 
-    /// Texture for `id`'s thumbnail at `path`, requesting a decode on miss.
+    /// Texture for `key`'s image at `path`, requesting a decode on miss.
     ///
     /// Returns [`TextureState::Ready`] once paintable; otherwise the caller
     /// draws a placeholder. Passing `None` (row not ingested yet) reports
     /// plain loading without touching any queue.
-    pub fn handle(&mut self, id: PhotoId, path: Option<&Path>) -> TextureState {
+    pub fn handle(&mut self, key: TexKey, path: Option<&Path>) -> TextureState {
         let Some(path) = path else {
             return TextureState::Loading;
         };
-        if let Some(slot) = self.slots.get_mut(&id) {
+        if let Some(slot) = self.slots.get_mut(&key) {
             if slot.path == path {
                 slot.last_used = self.frame;
                 return TextureState::Ready(slot.handle.clone());
             }
             // Same row re-ingested from a new file version: its old pixels
             // are wrong now, so forget them before re-keying below.
-            self.drop_slot(id);
+            self.drop_slot(key);
         }
-        if self.broken.get(&id).is_some_and(|stale| *stale == path) {
+        if self.broken.get(&key).is_some_and(|stale| *stale == path) {
             return TextureState::Broken;
         }
         let ticket = self.epoch.load(Ordering::Relaxed);
-        let needs_dispatch = match self.pending.get(&id) {
+        let needs_dispatch = match self.pending.get(&key) {
             Some(pending) => pending.path != path || pending.ticket != ticket,
             // Ticket aged out of a focus bump while the id stayed visible:
             // its worker-side job will be skipped, so re-issue it.
             None => true,
         };
         if needs_dispatch {
-            self.dispatch(id, path.to_owned());
+            self.dispatch(key, path.to_owned());
         }
         TextureState::Loading
     }
 
-    /// Reports the currently visible photo ids (sorted ascending), taken
-    /// from the grid each frame. A change bumps the focus epoch, which
-    /// cancels decodes for everything the user scrolled away from; entries
-    /// for still-visible ids survive regardless of age.
+    /// Reports the texture keys currently on screen (sorted ascending),
+    /// taken from the grid or loupe each frame. A change bumps the focus
+    /// epoch, which cancels decodes for everything the user scrolled away
+    /// from; entries for still-visible keys survive regardless of age.
     ///
     /// Cheap when the visible set is stable — the steady-state cost of a
     /// resting sheet is one slice comparison per frame.
-    pub fn focus(&mut self, visible: &[PhotoId]) {
+    pub fn focus(&mut self, visible: &[TexKey]) {
         debug_assert!(
             visible.is_sorted(),
-            "focus expects ids sorted by grid position"
+            "focus expects keys sorted by display position"
         );
         if visible != self.last_focus {
             self.last_focus.clear();
@@ -239,24 +286,24 @@ impl Textures {
         }
         let epoch = self.epoch.load(Ordering::Relaxed);
         self.pending
-            .retain(|id, pending| pending.ticket == epoch || visible.binary_search(id).is_ok());
+            .retain(|key, pending| pending.ticket == epoch || visible.binary_search(key).is_ok());
     }
 
-    /// Queues low-priority decodes for off-screen neighbours `(id, thumb
-    /// path)` so forward/backward scrolling finds tiles already decoded
-    /// (SPEC §5.3). Skips anything already live, broken or queued, and
-    /// pauses entirely while too many decodes are outstanding — visible
-    /// demand always wins the workers.
-    pub fn prefetch<'p>(&mut self, requests: impl Iterator<Item = (PhotoId, Option<&'p Path>)>) {
-        for (id, path) in requests {
+    /// Queues low-priority decodes for off-screen neighbours so forward/
+    /// backward scrolling finds tiles already decoded (SPEC §5.3) — grid
+    /// rows around the viewport and loupe id±3 alike. Skips anything
+    /// already live, broken or queued, and pauses entirely while too many
+    /// decodes are outstanding — visible demand always wins the workers.
+    pub fn prefetch<'p>(&mut self, requests: impl Iterator<Item = (TexKey, Option<&'p Path>)>) {
+        for (key, path) in requests {
             let Some(path) = path else {
                 continue;
             };
-            if self.slots.contains_key(&id)
-                || self.broken.contains_key(&id)
+            if self.slots.contains_key(&key)
+                || self.broken.contains_key(&key)
                 || self
                     .pending
-                    .get(&id)
+                    .get(&key)
                     .is_some_and(|pending| pending.path == path)
             {
                 continue;
@@ -268,14 +315,14 @@ impl Textures {
             }
             let ticket = self.epoch.load(Ordering::Relaxed);
             self.pending.insert(
-                id,
+                key,
                 Pending {
                     path: path.to_owned(),
                     ticket,
                 },
             );
             let _sent = self.prefetch_tx.send(Job {
-                id,
+                key,
                 path: path.to_owned(),
                 ticket,
             });
@@ -287,7 +334,7 @@ impl Textures {
     pub fn sync(&mut self, ctx: &egui::Context) {
         self.frame += 1;
         while let Ok(decoded) = self.decoded_rx.try_recv() {
-            if self.pending.get(&decoded.id).map(|p| p.path.as_path())
+            if self.pending.get(&decoded.key).map(|p| p.path.as_path())
                 == Some(decoded.path.as_path())
             {
                 self.ready.push_back(decoded);
@@ -303,25 +350,25 @@ impl Textures {
             let Some(shed) = self.ready.pop_front() else {
                 break;
             };
-            if self.pending.get(&shed.id).map(|p| p.path.as_path()) == Some(shed.path.as_path()) {
-                self.pending.remove(&shed.id);
+            if self.pending.get(&shed.key).map(|p| p.path.as_path()) == Some(shed.path.as_path()) {
+                self.pending.remove(&shed.key);
             }
         }
         for _ in 0..self.limits.max_uploads {
             let Some(decoded) = self.ready.pop_front() else {
                 break;
             };
-            if self.pending.get(&decoded.id).map(|p| p.path.as_path())
+            if self.pending.get(&decoded.key).map(|p| p.path.as_path())
                 != Some(decoded.path.as_path())
             {
                 continue;
             }
-            self.pending.remove(&decoded.id);
+            self.pending.remove(&decoded.key);
             match decoded.image {
-                Ok(image) => self.upload(ctx, decoded.id, decoded.path, image),
+                Ok(image) => self.upload(ctx, decoded.key, decoded.path, image),
                 Err(error) => {
-                    tracing::debug!(id = decoded.id.0, %error, "thumb decode failed");
-                    self.broken.insert(decoded.id, decoded.path);
+                    tracing::debug!(id = decoded.key.id.0, %error, "image decode failed");
+                    self.broken.insert(decoded.key, decoded.path);
                 }
             }
         }
@@ -335,11 +382,12 @@ impl Textures {
     }
 
     /// Forgets every texture and queue entry not in `keep`; used when a
-    /// folder closes so cancelled batches stop occupying budget.
+    /// folder closes so cancelled batches stop occupying budget. Applies
+    /// to both size classes of each id.
     pub fn retain(&mut self, keep: &std::collections::HashSet<PhotoId>) {
         let mut dropped_bytes = 0usize;
-        self.slots.retain(|id, slot| {
-            if keep.contains(id) {
+        self.slots.retain(|key, slot| {
+            if keep.contains(&key.id) {
                 true
             } else {
                 dropped_bytes += slot.bytes;
@@ -347,31 +395,31 @@ impl Textures {
             }
         });
         self.bytes -= dropped_bytes;
-        self.pending.retain(|id, _| keep.contains(id));
-        self.ready.retain(|decoded| keep.contains(&decoded.id));
-        self.broken.retain(|id, _| keep.contains(id));
+        self.pending.retain(|key, _| keep.contains(&key.id));
+        self.ready.retain(|decoded| keep.contains(&decoded.key.id));
+        self.broken.retain(|key, _| keep.contains(&key.id));
     }
 
-    fn dispatch(&mut self, id: PhotoId, path: PathBuf) {
+    fn dispatch(&mut self, key: TexKey, path: PathBuf) {
         let ticket = self.epoch.load(Ordering::Relaxed);
         self.pending.insert(
-            id,
+            key,
             Pending {
                 path: path.clone(),
                 ticket,
             },
         );
-        let _sent = self.demand_tx.send(Job { id, path, ticket });
+        let _sent = self.demand_tx.send(Job { key, path, ticket });
     }
 
-    fn upload(&mut self, ctx: &egui::Context, id: PhotoId, path: PathBuf, image: egui::ColorImage) {
+    fn upload(&mut self, ctx: &egui::Context, key: TexKey, path: PathBuf, image: egui::ColorImage) {
         let [width, height] = image.size;
         let bytes = width * height * 4;
-        let name = format!("thumb-{}", id.0);
+        let name = format!("{}-{}", key.class_prefix(), key.id.0);
         let handle = ctx.load_texture(&name, image, egui::TextureOptions::LINEAR);
         self.bytes += bytes;
         self.slots.insert(
-            id,
+            key,
             Slot {
                 handle,
                 path,
@@ -381,8 +429,8 @@ impl Textures {
         );
     }
 
-    fn drop_slot(&mut self, id: PhotoId) {
-        if let Some(slot) = self.slots.remove(&id) {
+    fn drop_slot(&mut self, key: TexKey) {
+        if let Some(slot) = self.slots.remove(&key) {
             self.bytes -= slot.bytes;
         }
     }
@@ -394,25 +442,25 @@ impl Textures {
         if self.bytes <= self.limits.byte_budget {
             return;
         }
-        let mut order: Vec<(u64, PhotoId)> = self
+        let mut order: Vec<(u64, TexKey)> = self
             .slots
             .iter()
-            .map(|(id, slot)| (slot.last_used, *id))
+            .map(|(key, slot)| (slot.last_used, *key))
             .collect();
         order.sort_unstable();
         let mut bytes = self.bytes;
         let mut victims = 0;
-        for (index, (_, id)) in order.iter().enumerate() {
+        for (index, (_, key)) in order.iter().enumerate() {
             if bytes <= self.limits.evict_target() {
                 break;
             }
-            if let Some(slot) = self.slots.get(id) {
+            if let Some(slot) = self.slots.get(key) {
                 bytes -= slot.bytes;
             }
             victims = index + 1;
         }
-        for (_, id) in &order[..victims] {
-            self.slots.remove(id);
+        for (_, key) in &order[..victims] {
+            self.slots.remove(key);
         }
     }
 }
@@ -443,7 +491,7 @@ impl Worker {
             }
             let image = decode_jpeg(&job.path);
             let _sent = self.decoded.send(Decoded {
-                id: job.id,
+                key: job.key,
                 path: job.path,
                 image,
             });
@@ -551,7 +599,7 @@ mod tests {
         let mut textures = textures_with(prod_limits());
 
         for (index, file) in files.iter().enumerate() {
-            textures.handle(PhotoId(index as u64), Some(file));
+            textures.handle(TexKey::thumb(PhotoId(index as u64)), Some(file));
         }
         let mut synced_frames = 0;
         let all_ready = env.settle(|| {
@@ -592,22 +640,22 @@ mod tests {
 
         // Load 1 and 2 sequentially so their recency stamps differ by
         // whole frames regardless of worker scheduling.
-        textures.handle(PhotoId(1), Some(&a));
+        textures.handle(TexKey::thumb(PhotoId(1)), Some(&a));
         let _ = env.settle(|| {
             textures.sync(&env.ctx);
-            textures.slots.contains_key(&PhotoId(1))
+            textures.slots.contains_key(&TexKey::thumb(PhotoId(1)))
         });
-        textures.handle(PhotoId(2), Some(&b));
+        textures.handle(TexKey::thumb(PhotoId(2)), Some(&b));
         let _ = env.settle(|| {
             textures.sync(&env.ctx);
-            textures.slots.contains_key(&PhotoId(2))
+            textures.slots.contains_key(&TexKey::thumb(PhotoId(2)))
         });
         // Advance one frame so the touch below stamps strictly newer
         // recency than 2's upload frame (ties fall back to id order).
         textures.sync(&env.ctx);
         // Touch 1 well after 2's upload so its recency clearly wins.
-        textures.handle(PhotoId(1), Some(&a));
-        textures.handle(PhotoId(3), Some(&c));
+        textures.handle(TexKey::thumb(PhotoId(1)), Some(&a));
+        textures.handle(TexKey::thumb(PhotoId(3)), Some(&c));
         let settled = env.settle(|| {
             textures.sync(&env.ctx);
             !textures.busy()
@@ -615,15 +663,15 @@ mod tests {
 
         assert!(settled, "third texture never arrived");
         assert!(
-            textures.slots.contains_key(&PhotoId(1)),
+            textures.slots.contains_key(&TexKey::thumb(PhotoId(1))),
             "recently used evicted"
         );
         assert!(
-            textures.slots.contains_key(&PhotoId(3)),
+            textures.slots.contains_key(&TexKey::thumb(PhotoId(3))),
             "fresh upload evicted"
         );
         assert!(
-            !textures.slots.contains_key(&PhotoId(2)),
+            !textures.slots.contains_key(&TexKey::thumb(PhotoId(2))),
             "LRU victim survived"
         );
     }
@@ -634,9 +682,9 @@ mod tests {
         let file = env.jpeg("cancel.jpg", 8, 6);
         let mut textures = textures_with(prod_limits());
 
-        textures.handle(PhotoId(7), Some(&file));
+        textures.handle(TexKey::thumb(PhotoId(7)), Some(&file));
         // The user scrolls: id 7 leaves the viewport, another id shows up.
-        textures.focus(&[PhotoId(8)]);
+        textures.focus(&[TexKey::thumb(PhotoId(8))]);
         let drained = env.settle(|| {
             textures.sync(&env.ctx);
             !textures.busy()
@@ -646,11 +694,11 @@ mod tests {
         assert!(textures.slots.is_empty(), "cancelled work reached the GPU");
 
         // Scrolled back into view: a fresh demand re-loads it.
-        textures.handle(PhotoId(7), Some(&file));
+        textures.handle(TexKey::thumb(PhotoId(7)), Some(&file));
         let loaded = env.settle(|| {
             textures.sync(&env.ctx);
             matches!(
-                textures.handle(PhotoId(7), Some(&file)),
+                textures.handle(TexKey::thumb(PhotoId(7)), Some(&file)),
                 TextureState::Ready(_)
             )
         });
@@ -671,7 +719,7 @@ mod tests {
         let mut textures = textures_with(limits);
 
         for (index, file) in files.iter().enumerate() {
-            textures.handle(PhotoId(index as u64), Some(file));
+            textures.handle(TexKey::thumb(PhotoId(index as u64)), Some(file));
         }
         // Let both workers finish all eight sub-millisecond decodes before
         // the first sync, so the backlog overflows deterministically.
@@ -684,18 +732,22 @@ mod tests {
             !textures.busy()
         });
         let missing: Vec<usize> = (0..files.len())
-            .filter(|index| !textures.slots.contains_key(&PhotoId(*index as u64)))
+            .filter(|index| {
+                !textures
+                    .slots
+                    .contains_key(&TexKey::thumb(PhotoId(*index as u64)))
+            })
             .collect();
 
         // Re-demanding the shed ids must recover every one of them.
         let all_recovered = env.settle(|| {
             for index in &missing {
-                textures.handle(PhotoId(*index as u64), Some(&files[*index]));
+                textures.handle(TexKey::thumb(PhotoId(*index as u64)), Some(&files[*index]));
             }
             textures.sync(&env.ctx);
             missing.iter().all(|index| {
                 matches!(
-                    textures.handle(PhotoId(*index as u64), Some(&files[*index])),
+                    textures.handle(TexKey::thumb(PhotoId(*index as u64)), Some(&files[*index])),
                     TextureState::Ready(_)
                 )
             })
@@ -717,11 +769,11 @@ mod tests {
         };
         let mut textures = textures_with(limits);
 
-        textures.handle(PhotoId(1), Some(&one));
+        textures.handle(TexKey::thumb(PhotoId(1)), Some(&one));
         textures.prefetch(
             [
-                (PhotoId(2), Some(two.as_path())),
-                (PhotoId(3), Some(three.as_path())),
+                (TexKey::thumb(PhotoId(2)), Some(two.as_path())),
+                (TexKey::thumb(PhotoId(3)), Some(three.as_path())),
             ]
             .into_iter(),
         );
@@ -731,9 +783,9 @@ mod tests {
             2,
             "prefetch ignored the saturation cap"
         );
-        assert!(textures.pending.contains_key(&PhotoId(1)));
-        assert!(textures.pending.contains_key(&PhotoId(2)));
-        assert!(!textures.pending.contains_key(&PhotoId(3)));
+        assert!(textures.pending.contains_key(&TexKey::thumb(PhotoId(1))));
+        assert!(textures.pending.contains_key(&TexKey::thumb(PhotoId(2))));
+        assert!(!textures.pending.contains_key(&TexKey::thumb(PhotoId(3))));
     }
 
     #[test]
@@ -743,26 +795,27 @@ mod tests {
         let new = env.jpeg("new.jpg", 10, 6);
         let mut textures = textures_with(prod_limits());
         let id = PhotoId(5);
+        let key = TexKey::thumb(id);
 
-        textures.handle(id, Some(&old));
+        textures.handle(key, Some(&old));
         let loaded = env.settle(|| {
             textures.sync(&env.ctx);
-            matches!(textures.handle(id, Some(&old)), TextureState::Ready(_))
+            matches!(textures.handle(key, Some(&old)), TextureState::Ready(_))
         });
         assert!(loaded, "initial load failed");
 
-        textures.handle(id, Some(&new));
+        textures.handle(key, Some(&new));
         assert!(matches!(
-            textures.handle(id, Some(&new)),
+            textures.handle(key, Some(&new)),
             TextureState::Loading
         ));
         let swapped = env.settle(|| {
             textures.sync(&env.ctx);
-            matches!(textures.handle(id, Some(&new)), TextureState::Ready(_))
+            matches!(textures.handle(key, Some(&new)), TextureState::Ready(_))
         });
 
         assert!(swapped, "re-ingested texture never became ready");
-        assert_eq!(textures.slots[&id].path, new, "slot kept the stale asset");
+        assert_eq!(textures.slots[&key].path, new, "slot kept the stale asset");
     }
 
     #[test]
@@ -772,15 +825,84 @@ mod tests {
         std::fs::write(&corrupt, b"not a jpeg").expect("write corrupt file");
         let mut textures = textures_with(prod_limits());
         let id = PhotoId(9);
+        let key = TexKey::thumb(id);
 
-        textures.handle(id, Some(&corrupt));
+        textures.handle(key, Some(&corrupt));
         let marked = env.settle(|| {
             textures.sync(&env.ctx);
-            matches!(textures.handle(id, Some(&corrupt)), TextureState::Broken)
+            matches!(textures.handle(key, Some(&corrupt)), TextureState::Broken)
         });
 
         assert!(marked, "decode failure never surfaced as Broken");
         assert!(!textures.busy(), "broken asset keeps retrying");
+    }
+
+    #[test]
+    fn thumb_and_screen_classes_should_cache_independently_for_one_id() {
+        let env = Env::new();
+        let thumb = env.jpeg("t.jpg", 8, 6);
+        let screen = env.jpeg("s.jpg", 32, 24);
+        let mut textures = textures_with(prod_limits());
+        let id = PhotoId(3);
+        let thumb_key = TexKey::thumb(id);
+        let screen_key = TexKey::screen(id);
+
+        textures.handle(thumb_key, Some(&thumb));
+        textures.handle(screen_key, Some(&screen));
+        let both_ready = env.settle(|| {
+            textures.sync(&env.ctx);
+            matches!(
+                textures.handle(thumb_key, Some(&thumb)),
+                TextureState::Ready(_)
+            ) && matches!(
+                textures.handle(screen_key, Some(&screen)),
+                TextureState::Ready(_)
+            )
+        });
+
+        assert!(both_ready, "the two classes never became ready together");
+        assert_eq!(textures.slots.len(), 2, "one class evicted the other");
+        assert_ne!(
+            textures.slots[&thumb_key].handle.id(),
+            textures.slots[&screen_key].handle.id(),
+            "classes shared one texture"
+        );
+    }
+
+    #[test]
+    fn focus_should_cancel_only_the_requested_class() {
+        let env = Env::new();
+        let file = env.jpeg("cls.jpg", 8, 6);
+        let mut textures = textures_with(prod_limits());
+        let id = PhotoId(4);
+        let thumb_key = TexKey::thumb(id);
+        let screen_key = TexKey::screen(id);
+
+        // A thumb decode is in flight when the loupe takes over the focus;
+        // the epoch bump must cancel the off-screen thumb class.
+        textures.handle(thumb_key, Some(&file));
+        textures.focus(&[screen_key]);
+        let settled = env.settle(|| {
+            textures.sync(&env.ctx);
+            !textures.busy()
+        });
+
+        assert!(settled);
+        assert!(
+            textures.slots.is_empty(),
+            "cancelled thumb class reached the GPU"
+        );
+
+        // The focused screen class still loads normally afterwards.
+        textures.handle(screen_key, Some(&file));
+        let loaded = env.settle(|| {
+            textures.sync(&env.ctx);
+            matches!(
+                textures.handle(screen_key, Some(&file)),
+                TextureState::Ready(_)
+            )
+        });
+        assert!(loaded, "focused screen key never loaded");
     }
 
     #[test]
@@ -813,7 +935,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut textures = Textures::new();
         for (index, file) in files.iter().enumerate() {
-            textures.handle(PhotoId(index as u64), Some(file));
+            textures.handle(TexKey::thumb(PhotoId(index as u64)), Some(file));
         }
 
         let started = std::time::Instant::now();
@@ -847,7 +969,7 @@ mod tests {
         while textures.slots.len() < files.len() {
             assert!(frames < 200_000, "re-demand did not converge");
             for (index, file) in files.iter().enumerate() {
-                textures.handle(PhotoId(index as u64), Some(file));
+                textures.handle(TexKey::thumb(PhotoId(index as u64)), Some(file));
             }
             while textures.busy() {
                 frame(&mut textures, &ctx, &mut worst);
@@ -862,5 +984,75 @@ mod tests {
             frames - burst_frames,
         );
         assert_eq!(textures.slots.len(), files.len(), "not every thumb landed");
+    }
+
+    #[test]
+    /// SPEC §8 loupe gate: opening the loupe on a 24 MP preview must stay
+    /// under 400 ms cold (disk read + JPEG decode) and 30 ms warm (texture
+    /// resident). Release mode, like the other perf gates:
+    ///
+    /// ```text
+    /// CULLR_PERF=<dir> cargo test --release -p cullr-ui -- loupe --ignored
+    /// ```
+    #[ignore = "perf gate: run with CULLR_PERF set, release mode"]
+    fn loupe_open_should_meet_the_cold_and_warm_budgets() {
+        let Some(scratch_base) = std::env::var_os("CULLR_PERF").map(std::path::PathBuf::from)
+        else {
+            return;
+        };
+        let env_dir = tempfile::tempdir_in(scratch_base).expect("scratch dir");
+        // 6000×4000 matches a full-size modern camera embedded preview.
+        let mut pixels = image::RgbImage::new(6000, 4000);
+        for (x, y, pixel) in pixels.enumerate_pixels_mut() {
+            *pixel = image::Rgb([(x % 255) as u8, (y % 255) as u8, ((x + y) % 255) as u8]);
+        }
+        let path = env_dir.path().join("loupe-perf.jpg");
+        let file = std::fs::File::create(&path).expect("create perf jpeg");
+        let encoder =
+            image::codecs::jpeg::JpegEncoder::new_with_quality(std::io::BufWriter::new(file), 88);
+        pixels
+            .write_with_encoder(encoder)
+            .expect("encode perf jpeg");
+
+        let ctx = egui::Context::default();
+        let key = TexKey::screen(PhotoId(1));
+
+        // Cold: demand → worker decode → upload must fit in 400 ms.
+        let mut textures = Textures::new();
+        let cold_started = std::time::Instant::now();
+        textures.handle(key, Some(&path));
+        let ready = loop {
+            textures.sync(&ctx);
+            if matches!(textures.handle(key, Some(&path)), TextureState::Ready(_)) {
+                break true;
+            }
+            if cold_started.elapsed() > std::time::Duration::from_secs(10) {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        let cold = cold_started.elapsed();
+        assert!(ready, "screen texture never became ready");
+        assert!(
+            cold < std::time::Duration::from_millis(400),
+            "cold loupe open took {cold:?} vs 400 ms budget"
+        );
+
+        // Warm: the slot is resident; a full open pass is just bookkeeping.
+        let warm_started = std::time::Instant::now();
+        for _ in 0..100 {
+            textures.focus(&[key]);
+            assert!(matches!(
+                textures.handle(key, Some(&path)),
+                TextureState::Ready(_)
+            ));
+            textures.sync(&ctx);
+        }
+        let warm = warm_started.elapsed() / 100;
+        assert!(
+            warm < std::time::Duration::from_millis(30),
+            "warm loupe open took {warm:?} vs 30 ms budget"
+        );
+        println!("loupe open: cold {cold:?} / warm {warm:?}");
     }
 }

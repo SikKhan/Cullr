@@ -20,7 +20,8 @@ use cullr_core::PhotoId;
 use cullr_core::PhotoStatus;
 
 use super::Action;
-use crate::tex::{TextureState, Textures};
+use super::loupe;
+use crate::tex::{TexKey, TextureState, Textures};
 use crate::theme;
 
 /// Cell width; height derives from the default photo aspect.
@@ -58,6 +59,9 @@ pub struct GridView {
     last_ping: Vec<PhotoId>,
     /// Ping waiting to be collected by the app, if any.
     ping: Option<Vec<PhotoId>>,
+    /// Full-screen preview state while the loupe is open; `None` shows
+    /// the contact sheet (SPEC §6: Grid ⇄ Loupe).
+    loupe: Option<loupe::LoupeView>,
 }
 
 impl GridView {
@@ -74,6 +78,7 @@ impl GridView {
             ingest_done: 0,
             last_ping: Vec::new(),
             ping: None,
+            loupe: None,
         }
     }
 
@@ -144,17 +149,23 @@ impl GridView {
     }
 
     /// Draws the screen and reports the user's action, if any.
-    pub fn ui(&mut self, ui: &mut egui::Ui, textures: &mut Textures) -> Option<Action> {
+    pub fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        db: &cullr_core::Db,
+        textures: &mut Textures,
+    ) -> Option<Action> {
         let mut action = None;
-        // Keyboard-first navigation: Esc leaves the grid from anywhere.
-        if ui.ctx().input(|input| input.key_pressed(egui::Key::Escape)) {
+        // Keyboard-first navigation: while the loupe is up it owns Esc
+        // (back to the sheet); otherwise Esc leaves the grid entirely.
+        if self.loupe.is_none() && ui.ctx().input(|input| input.key_pressed(egui::Key::Escape)) {
             action = Some(Action::BackToHome);
         }
 
         egui::Panel::top(egui::Id::new("cullr_grid_top_bar")).show(ui, |ui| {
             self.top_bar(ui, &mut action);
         });
-        egui::CentralPanel::default().show(ui, |ui| self.body(ui, textures));
+        egui::CentralPanel::default().show(ui, |ui| self.body(ui, db, textures));
 
         action
     }
@@ -196,8 +207,20 @@ impl GridView {
         });
     }
 
-    /// Body: scanning notice, failure notice, empty notice or tile sheet.
-    fn body(&mut self, ui: &mut egui::Ui, textures: &mut Textures) {
+    /// Body: loupe when open, otherwise scanning notice, failure notice,
+    /// empty notice or tile sheet.
+    fn body(&mut self, ui: &mut egui::Ui, db: &cullr_core::Db, textures: &mut Textures) {
+        if let Some(active) = self.loupe.as_mut() {
+            // The loupe borrows the sheet's entries in place so ingest
+            // events keep flowing into the same source of truth; its
+            // index stays valid because rows never leave mid-session.
+            let outcome = active.ui(ui, db, &self.entries, textures);
+            if outcome == loupe::Outcome::Close {
+                self.loupe = None;
+            }
+            return;
+        }
+
         if self.loading {
             ui.vertical_centered(|ui| {
                 ui.add_space(ui.available_height() / 2.0 - 40.0);
@@ -258,8 +281,9 @@ impl GridView {
         let columns = columns_for_width(ui.available_width()).max(1);
         let total_rows = self.entries.len().div_ceil(columns);
         let entries = &self.entries;
-        let mut visible_ids: Vec<PhotoId> = Vec::new();
+        let mut visible_keys: Vec<TexKey> = Vec::new();
         let mut visible_pending: Vec<PhotoId> = Vec::new();
+        let mut clicked: Option<usize> = None;
         let mut rows_shown = 0..0;
 
         egui::ScrollArea::vertical().auto_shrink(false).show_rows(
@@ -271,11 +295,14 @@ impl GridView {
                 for row in rows {
                     ui.horizontal(|ui| {
                         for column in 0..columns {
-                            let Some(entry) = entries.get(row * columns + column) else {
+                            let position = row * columns + column;
+                            let Some(entry) = entries.get(position) else {
                                 break;
                             };
-                            visible_ids.push(entry.id);
-                            draw_cell(ui, textures, entry, &mut visible_pending);
+                            visible_keys.push(TexKey::thumb(entry.id));
+                            if draw_cell(ui, textures, entry, &mut visible_pending) {
+                                clicked = Some(position);
+                            }
                         }
                     });
                 }
@@ -283,9 +310,14 @@ impl GridView {
         );
 
         // Row-major traversal is already sorted; `focus` relies on that.
-        visible_ids.sort_unstable();
-        textures.focus(&visible_ids);
+        visible_keys.sort_unstable();
+        textures.focus(&visible_keys);
         self.prefetch_band(textures, rows_shown, columns, total_rows);
+
+        // Clicking a tile opens the loupe on it (SPEC §6 Grid ⇄ Loupe).
+        if let Some(position) = clicked {
+            self.loupe = Some(loupe::LoupeView::at(position));
+        }
 
         visible_pending.sort_unstable();
         if visible_pending != self.last_ping && !visible_pending.is_empty() {
@@ -316,21 +348,22 @@ impl GridView {
             .flat_map(|row| (0..columns).map(move |column| row * columns + column))
             .filter_map(|cell| entries.get(cell))
             .filter(|entry| entry.status == PhotoStatus::Ok)
-            .map(|entry| (entry.id, entry.thumb_path.as_deref()));
+            .map(|entry| (TexKey::thumb(entry.id), entry.thumb_path.as_deref()));
         textures.prefetch(band);
     }
 }
 
 /// One grid cell: panel rectangle, aspect-fit thumbnail (or spinner /
 /// error fallback) and the filename strip with its color-label dot.
+/// Reports whether the cell was clicked (open in loupe).
 fn draw_cell(
     ui: &mut egui::Ui,
     textures: &mut Textures,
     entry: &PhotoEntry,
     visible_pending: &mut Vec<PhotoId>,
-) {
+) -> bool {
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(CELL_WIDTH, CELL_HEIGHT), egui::Sense::hover());
+        ui.allocate_exact_size(egui::vec2(CELL_WIDTH, CELL_HEIGHT), egui::Sense::click());
     ui.painter().rect_filled(rect, 6.0, theme::PANEL);
 
     let image_area = egui::Rect::from_min_max(
@@ -344,7 +377,10 @@ fn draw_cell(
         Some(message) => format!("{}\n⚠ {message}", entry.rel_path.display()),
         None => entry.rel_path.display().to_string(),
     };
+    // `on_hover_text` consumes the response, so read the click first.
+    let clicked = response.clicked();
     response.on_hover_text(tooltip);
+    clicked
 }
 
 /// Image region of a cell: thumbnail when ready, spinner while pending or
@@ -358,29 +394,31 @@ fn draw_image_area(
 ) {
     let painter = ui.painter();
     match entry.status {
-        PhotoStatus::Ok => match textures.handle(entry.id, entry.thumb_path.as_deref()) {
-            TextureState::Ready(handle) => {
-                let fitted = fit_rect(area, entry.display_aspect());
-                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-                painter.image(handle.id(), fitted, uv, egui::Color32::WHITE);
+        PhotoStatus::Ok => {
+            match textures.handle(TexKey::thumb(entry.id), entry.thumb_path.as_deref()) {
+                TextureState::Ready(handle) => {
+                    let fitted = fit_rect(area, entry.display_aspect());
+                    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                    painter.image(handle.id(), fitted, uv, egui::Color32::WHITE);
+                }
+                TextureState::Broken => {
+                    painter.text(
+                        area.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "⚠",
+                        egui::FontId::proportional(30.0),
+                        theme::MUTED,
+                    );
+                }
+                TextureState::Loading => {
+                    let spinner = egui::Spinner::new().size(SPINNER_SIZE);
+                    ui.put(
+                        egui::Rect::from_center_size(area.center(), egui::vec2(24.0, 24.0)),
+                        spinner,
+                    );
+                }
             }
-            TextureState::Broken => {
-                painter.text(
-                    area.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "⚠",
-                    egui::FontId::proportional(30.0),
-                    theme::MUTED,
-                );
-            }
-            TextureState::Loading => {
-                let spinner = egui::Spinner::new().size(SPINNER_SIZE);
-                ui.put(
-                    egui::Rect::from_center_size(area.center(), egui::vec2(24.0, 24.0)),
-                    spinner,
-                );
-            }
-        },
+        }
         PhotoStatus::Pending => {
             visible_pending.push(entry.id);
             let spinner = egui::Spinner::new().size(SPINNER_SIZE);
@@ -450,7 +488,8 @@ fn columns_for_width(width: f32) -> usize {
 }
 
 /// Largest centered rectangle with `aspect` that fits inside `container`.
-fn fit_rect(container: egui::Rect, aspect: f32) -> egui::Rect {
+/// Shared with the loupe, which fits the same previews to the window.
+pub(crate) fn fit_rect(container: egui::Rect, aspect: f32) -> egui::Rect {
     let aspect = aspect.max(0.01);
     let width = container.width().min(container.height() * aspect);
     let height = width / aspect;

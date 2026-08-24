@@ -1,0 +1,733 @@
+//! Loupe view: full-screen preview with fit/zoom/pan (SPEC §6).
+//!
+//! The photo renders aspect-fit inside the viewport; the wheel zooms
+//! toward the cursor between fit (×1) and pixel parity (100%), dragging
+//! pans while clamped so the image can never be flung off-screen, and
+//! `Space` toggles the two extremes. Arrows walk the folder order,
+//! `Esc`/`Enter` return to the sheet. While the screen-size texture
+//! decodes, a shimmer placeholder keeps the frame alive; neighbours ±3
+//! positions prefetch their previews in the background (SPEC §5.3).
+//!
+//! Overlays: a top-right pill with the color label and position counter
+//! (`142 / 3 210`) and a bottom EXIF summary bar.
+
+use eframe::egui;
+
+use cullr_core::Db;
+use cullr_core::PhotoDetail;
+use cullr_core::PhotoEntry;
+use cullr_core::PhotoStatus;
+
+use crate::tex::TexKey;
+use crate::tex::TextureState;
+use crate::tex::Textures;
+use crate::theme;
+
+/// Zoom multiplier at fit-to-window; all zooming lives in `[1, max]`.
+const FIT_ZOOM: f32 = 1.0;
+/// Exponential wheel gain: scroll delta × gain, exponentiated.
+const WHEEL_GAIN: f32 = 0.0016;
+/// Per-frame wheel step clamp so a runaway trackpad cannot teleport zoom.
+const WHEEL_STEP_MAX: f32 = 1.35;
+/// Height of the bottom EXIF bar.
+const BAR_HEIGHT: f32 = 30.0;
+/// How many positions on each side of the current photo prefetch their
+/// screen texture (SPEC §5.3: loupe id±3).
+const NEIGHBOR_REACH: usize = 3;
+
+/// What the loupe wants the app to do after this frame.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// Keep showing the loupe.
+    Stay,
+    /// Return to the contact sheet.
+    Close,
+}
+
+/// State of the loupe for one browsing session over the grid's entries.
+pub struct LoupeView {
+    /// Position in the folder order currently on display.
+    index: usize,
+    /// Zoom multiplier over the fit rectangle; [`FIT_ZOOM`] means fit.
+    zoom: f32,
+    /// Displayed-image-center offset from the viewport center.
+    pan: egui::Vec2,
+}
+
+impl LoupeView {
+    /// Opens the loupe on `index`, fitted to the window.
+    pub fn at(index: usize) -> Self {
+        Self {
+            index,
+            zoom: FIT_ZOOM,
+            pan: egui::Vec2::ZERO,
+        }
+    }
+
+    /// Draws the screen, consumes input, and reports the next action.
+    pub fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        db: &Db,
+        entries: &[PhotoEntry],
+        textures: &mut Textures,
+    ) -> Outcome {
+        if entries.is_empty() || self.index >= entries.len() {
+            return Outcome::Close;
+        }
+        let (left, right, escape, enter) = ui.ctx().input(|input| {
+            (
+                input.key_pressed(egui::Key::ArrowLeft),
+                input.key_pressed(egui::Key::ArrowRight),
+                input.key_pressed(egui::Key::Escape),
+                input.key_pressed(egui::Key::Enter),
+            )
+        });
+        if escape || enter {
+            return Outcome::Close;
+        }
+        // Navigation resets to fit: each photo starts centered.
+        if left && self.index > 0 {
+            self.move_to(self.index - 1);
+        }
+        if right && self.index + 1 < entries.len() {
+            self.move_to(self.index + 1);
+        }
+
+        let entry = &entries[self.index];
+        let detail = fetch_detail(db, entry.id);
+
+        // Focus cancels stale neighbour decodes when flying through the
+        // set; the band around the current photo refills the queues.
+        // Each neighbour needs its own row for the preview asset path;
+        // the per-photo point queries are microsecond-scale.
+        textures.focus(&[TexKey::screen(entry.id)]);
+        for position in neighbor_indices(self.index, entries.len(), NEIGHBOR_REACH) {
+            let Some(neighbor) = entries.get(position) else {
+                continue;
+            };
+            if neighbor.status != PhotoStatus::Ok {
+                continue;
+            }
+            let path = fetch_detail(db, neighbor.id).and_then(|detail| detail.preview_path);
+            let key = TexKey::screen(neighbor.id);
+            textures.prefetch([(key, path.as_deref())].into_iter());
+        }
+
+        let (area, response) =
+            ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+        let image_area = egui::Rect::from_min_max(area.min, area.max - egui::vec2(0.0, BAR_HEIGHT));
+        let aspect = image_aspect(entry);
+        let fitted_size = super::grid::fit_rect(image_area, aspect).size();
+        let max_zoom = max_zoom(entry, fitted_size);
+
+        if ui.ctx().input(|input| input.key_pressed(egui::Key::Space)) {
+            let zoomed_in = self.zoom > FIT_ZOOM + f32::EPSILON * 8.0;
+            self.zoom = if zoomed_in { FIT_ZOOM } else { max_zoom };
+            self.pan = egui::Vec2::ZERO;
+        }
+
+        let scroll = ui.input(|input| input.smooth_scroll_delta.y);
+        if scroll != 0.0
+            && response.hovered()
+            && let Some(cursor) = response.hover_pos()
+        {
+            let factor = (scroll * WHEEL_GAIN)
+                .exp()
+                .clamp(1.0 / WHEEL_STEP_MAX, WHEEL_STEP_MAX);
+            let (zoom, pan) = zoom_step(
+                self.zoom,
+                self.pan,
+                factor,
+                max_zoom,
+                cursor - area.center(),
+                fitted_size,
+                image_area.size(),
+            );
+            self.zoom = zoom;
+            self.pan = pan;
+        }
+        if response.dragged() {
+            self.pan = clamp_pan(
+                self.pan + response.drag_delta(),
+                fitted_size * self.zoom,
+                image_area.size(),
+            );
+        }
+
+        paint_photo(
+            ui,
+            textures,
+            entry,
+            preview_path(&detail),
+            image_area,
+            aspect,
+            self.zoom,
+            self.pan,
+        );
+        draw_position_overlay(
+            ui.painter(),
+            image_area,
+            detail.as_ref(),
+            self.index + 1,
+            entries.len(),
+        );
+        draw_exif_bar(ui.painter(), area, detail.as_ref(), entry);
+
+        Outcome::Stay
+    }
+
+    /// Jumps to `index` and recenters: every photo starts at fit.
+    fn move_to(&mut self, index: usize) {
+        self.index = index;
+        self.zoom = FIT_ZOOM;
+        self.pan = egui::Vec2::ZERO;
+    }
+}
+
+fn fetch_detail(db: &Db, id: cullr_core::PhotoId) -> Option<PhotoDetail> {
+    match db.photo_detail(id) {
+        Ok(detail) => detail,
+        Err(error) => {
+            tracing::warn!(%error, id = id.0, "cannot load photo details");
+            None
+        }
+    }
+}
+
+/// Preview asset path of the photo on display.
+fn preview_path(detail: &Option<PhotoDetail>) -> Option<&std::path::Path> {
+    detail
+        .as_ref()
+        .and_then(|detail| detail.preview_path.as_deref())
+}
+
+/// Positions adjacent to `index`, nearest first, both directions,
+/// clamped to the set. Pure so the prefetch band is testable.
+fn neighbor_indices(index: usize, len: usize, reach: usize) -> impl Iterator<Item = usize> {
+    (1..=reach)
+        .flat_map(move |distance| [index.checked_sub(distance), Some(index + distance)])
+        .flatten()
+        .filter(move |&position| position < len)
+}
+
+/// Aspect of the stored preview pixels (unrotated, matching what was
+/// decoded into the texture).
+fn image_aspect(entry: &PhotoEntry) -> f32 {
+    entry
+        .pixels
+        .and_then(|(width, height)| {
+            if width == 0 || height == 0 {
+                None
+            } else {
+                Some(width as f32 / height as f32)
+            }
+        })
+        .unwrap_or(cullr_core::DEFAULT_ASPECT)
+}
+
+/// Zoom multiplier that makes the image pixel-parity (100%) in the
+/// viewport; at least [`FIT_ZOOM`] so small previews stay put.
+fn max_zoom(entry: &PhotoEntry, fitted_size: egui::Vec2) -> f32 {
+    let Some((width, _)) = entry.pixels else {
+        return FIT_ZOOM;
+    };
+    if fitted_size.x <= 0.0 {
+        return FIT_ZOOM;
+    }
+    (width as f32 / fitted_size.x).max(FIT_ZOOM)
+}
+
+/// Keeps the displayed image pinned to the viewport: at fit there is no
+/// slack (always centered); zoomed in, edges may reach but never pass
+/// the viewport edge.
+fn clamp_pan(pan: egui::Vec2, displayed: egui::Vec2, viewport: egui::Vec2) -> egui::Vec2 {
+    let slack_x = ((displayed.x - viewport.x) / 2.0).max(0.0);
+    let slack_y = ((displayed.y - viewport.y) / 2.0).max(0.0);
+    egui::vec2(
+        pan.x.clamp(-slack_x, slack_x),
+        pan.y.clamp(-slack_y, slack_y),
+    )
+}
+
+/// One multiplicative zoom step keeping the image point under the cursor
+/// fixed on screen.
+///
+/// `cursor_from_center` is the pointer relative to the viewport center;
+/// internally converted to a fraction of the displayed image so anchoring
+/// stays exact at any pan. Snaps back to perfectly centered when the
+/// clamp returns zoom to fit.
+fn zoom_step(
+    zoom: f32,
+    pan: egui::Vec2,
+    factor: f32,
+    max_zoom: f32,
+    cursor_from_center: egui::Vec2,
+    fitted_size: egui::Vec2,
+    viewport: egui::Vec2,
+) -> (f32, egui::Vec2) {
+    let new_zoom = (zoom * factor).clamp(FIT_ZOOM, max_zoom.max(FIT_ZOOM));
+    if (new_zoom - zoom).abs() <= f32::EPSILON * 8.0 {
+        return (zoom, pan);
+    }
+    // Fraction of the image (relative to its center) under the cursor.
+    let anchor = (cursor_from_center - pan) / (fitted_size * zoom);
+    let new_pan = cursor_from_center - anchor * (fitted_size * new_zoom);
+    if new_zoom <= FIT_ZOOM + f32::EPSILON * 8.0 {
+        return (new_zoom, egui::Vec2::ZERO);
+    }
+    (
+        new_zoom,
+        clamp_pan(new_pan, fitted_size * new_zoom, viewport),
+    )
+}
+
+/// The photo itself: ready texture (zoomable), shimmer while decoding,
+/// spinner while extraction is pending, warning fallback otherwise.
+#[expect(clippy::too_many_arguments)]
+fn paint_photo(
+    ui: &mut egui::Ui,
+    textures: &mut Textures,
+    entry: &PhotoEntry,
+    preview_path: Option<&std::path::Path>,
+    area: egui::Rect,
+    aspect: f32,
+    zoom: f32,
+    pan: egui::Vec2,
+) {
+    let painter = ui.painter().clone();
+    painter.rect_filled(area, 0.0, theme::BG);
+    let center = area.center() + pan;
+    match entry.status {
+        PhotoStatus::Ok => match textures.handle(TexKey::screen(entry.id), preview_path) {
+            TextureState::Ready(handle) => {
+                let displayed = super::grid::fit_rect(area, aspect).size() * zoom;
+                let destination = egui::Rect::from_center_size(center, displayed);
+                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                painter.image(handle.id(), destination, uv, egui::Color32::WHITE);
+            }
+            TextureState::Loading => draw_shimmer(&painter, area, ui.input(|input| input.time)),
+            TextureState::Broken => draw_warning(&painter, area, "Preview could not be decoded"),
+        },
+        PhotoStatus::Pending => {
+            let spinner = egui::Spinner::new().size(28.0);
+            ui.put(
+                egui::Rect::from_center_size(center, egui::vec2(32.0, 32.0)),
+                spinner,
+            );
+            painter.text(
+                center + egui::vec2(0.0, 36.0),
+                egui::Align2::CENTER_CENTER,
+                "Extracting preview…",
+                egui::FontId::proportional(13.0),
+                theme::MUTED,
+            );
+        }
+        other => {
+            let message = if other == PhotoStatus::Error {
+                entry
+                    .err_msg
+                    .as_deref()
+                    .unwrap_or("Extraction failed")
+                    .to_owned()
+            } else {
+                "File is missing".to_owned()
+            };
+            draw_warning(&painter, area, &message);
+        }
+    }
+}
+
+/// Animated placeholder while the preview decodes: a soft light band
+/// sweeps across the dark frame so waiting reads as progress, not freeze.
+fn draw_shimmer(painter: &egui::Painter, area: egui::Rect, time: f64) {
+    let painter = painter.with_clip_rect(area);
+    painter.rect_filled(area, 0.0, theme::PANEL);
+    let band_width = (area.width() * 0.3).max(60.0);
+    let travel = area.width() + band_width;
+    let lead = area.left() - band_width + travel * ((time * 0.45) % 1.0) as f32;
+    let slice = band_width / 7.0;
+    for step in -3..=3_i32 {
+        let alpha = 16 - step.abs() * 5;
+        let x = lead + step as f32 * slice;
+        painter.rect_filled(
+            egui::Rect::from_min_size(egui::pos2(x, area.top()), egui::vec2(slice, area.height())),
+            0.0,
+            egui::Color32::from_white_alpha(alpha.max(0) as u8),
+        );
+    }
+}
+
+/// Centered warning glyph plus explanation for unviewable photos.
+fn draw_warning(painter: &egui::Painter, area: egui::Rect, message: &str) {
+    painter.text(
+        area.center() - egui::vec2(0.0, 14.0),
+        egui::Align2::CENTER_CENTER,
+        "⚠",
+        egui::FontId::proportional(34.0),
+        theme::MUTED,
+    );
+    painter.text(
+        area.center() + egui::vec2(0.0, 18.0),
+        egui::Align2::CENTER_CENTER,
+        message,
+        egui::FontId::proportional(13.0),
+        theme::MUTED,
+    );
+}
+
+/// Top-right pill: color-label dot plus position counter `n / total`
+/// with thin-space thousands grouping.
+fn draw_position_overlay(
+    painter: &egui::Painter,
+    area: egui::Rect,
+    detail: Option<&PhotoDetail>,
+    ordinal: usize,
+    total: usize,
+) {
+    let counter = format!("{} / {}", grouped(ordinal), grouped(total));
+    let galley = painter.layout_no_wrap(counter, egui::FontId::proportional(12.0), theme::TEXT);
+    let dot_diameter = 9.0;
+    let gap = 8.0;
+    let padding_x = 11.0;
+    let height = 24.0;
+    let width = padding_x + dot_diameter + gap + galley.size().x + padding_x;
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(area.right() - width - 12.0, area.top() + 12.0),
+        egui::vec2(width, height),
+    );
+    painter.rect_filled(rect, height / 2.0, egui::Color32::from_black_alpha(150));
+
+    let dot_center = egui::pos2(
+        rect.left() + padding_x + dot_diameter / 2.0,
+        rect.center().y,
+    );
+    match detail.map(|detail| detail.label) {
+        Some(label) if label != cullr_core::Label::None => {
+            painter.circle_filled(dot_center, dot_diameter / 2.0, theme::label_color(label));
+        }
+        _ => {
+            painter.circle_stroke(
+                dot_center,
+                dot_diameter / 2.0,
+                egui::Stroke::new(1.25, theme::MUTED),
+            );
+        }
+    }
+    painter.galley(
+        egui::pos2(
+            rect.left() + padding_x + dot_diameter + gap,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        theme::TEXT,
+    );
+}
+
+/// Bottom bar with the EXIF summary (`camera · lens · f/x · shutter ·
+/// ISO · mm · timestamp`), falling back to the file name.
+fn draw_exif_bar(
+    painter: &egui::Painter,
+    area: egui::Rect,
+    detail: Option<&PhotoDetail>,
+    entry: &PhotoEntry,
+) {
+    let bar = egui::Rect::from_min_max(
+        egui::pos2(area.left(), area.bottom() - BAR_HEIGHT),
+        area.right_bottom(),
+    );
+    painter.rect_filled(bar, 0.0, theme::PANEL);
+    let line = detail.map_or_else(|| file_name(entry), |detail| exif_line(detail, entry));
+    painter.text(
+        egui::pos2(bar.left() + 12.0, bar.center().y),
+        egui::Align2::LEFT_CENTER,
+        line,
+        egui::FontId::proportional(12.0),
+        theme::MUTED,
+    );
+}
+
+/// Builds the EXIF summary line; absent fields are skipped rather than
+/// shown as gaps, and an all-empty record degrades to the file name.
+fn exif_line(detail: &PhotoDetail, entry: &PhotoEntry) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for text in [
+        detail.camera.clone(),
+        detail.lens.clone(),
+        detail
+            .aperture
+            .map(|value| format!("f/{}", trim_number(value))),
+        detail.shutter.clone(),
+        detail.iso.map(|value| format!("ISO {value}")),
+        detail
+            .focal_mm
+            .map(|value| format!("{}mm", trim_number(value))),
+        detail.taken_at.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        parts.push(text);
+    }
+    if parts.is_empty() {
+        file_name(entry)
+    } else {
+        parts.join(" · ")
+    }
+}
+
+/// Renders a float without a dangling `.0` (`2.8` stays, `35.0` → `35`).
+fn trim_number(value: f64) -> String {
+    let rounded = value.round();
+    if (value - rounded).abs() < 0.05 {
+        format!("{rounded:.0}")
+    } else {
+        format!("{value:.1}")
+    }
+}
+
+/// Thousands grouping with narrow no-break spaces, as in `3 210`.
+fn grouped(value: usize) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3 * '\u{202f}'.len_utf8());
+    for (index, digit) in digits.chars().enumerate() {
+        // Separator goes where exactly three digits remain behind it.
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push('\u{202f}');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+fn file_name(entry: &PhotoEntry) -> String {
+    entry.rel_path.file_name().map_or_else(
+        || entry.rel_path.to_string_lossy().into_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_pan_should_pin_fit_images_to_the_center() {
+        let viewport = egui::vec2(800.0, 600.0);
+        let displayed = viewport * 0.5;
+        assert_eq!(
+            clamp_pan(egui::vec2(120.0, -90.0), displayed, viewport),
+            egui::Vec2::ZERO
+        );
+    }
+
+    #[test]
+    fn clamp_pan_should_stop_at_image_edges_when_zoomed() {
+        let viewport = egui::vec2(800.0, 600.0);
+        // Displayed twice the viewport: 400 px of horizontal slack.
+        assert_eq!(
+            clamp_pan(egui::vec2(-900.0, 50.0), viewport * 2.0, viewport),
+            egui::vec2(-400.0, 50.0)
+        );
+    }
+
+    #[test]
+    fn zoom_step_should_keep_the_cursor_point_fixed_without_panning() {
+        let viewport = egui::vec2(800.0, 600.0);
+        let fitted = egui::vec2(600.0, 400.0);
+        // Pointer on the image center: zooming must not drift the image.
+        let cursor = egui::Vec2::ZERO;
+
+        let (zoom, pan) = zoom_step(1.0, egui::Vec2::ZERO, 2.0, 4.0, cursor, fitted, viewport);
+
+        assert!((zoom - 2.0).abs() < 1e-4);
+        assert!(pan.x.abs() < 1e-4 && pan.y.abs() < 1e-4);
+    }
+
+    #[test]
+    fn zoom_step_should_anchor_the_zoomed_point_under_the_cursor() {
+        let viewport = egui::vec2(800.0, 600.0);
+        let fitted = egui::vec2(600.0, 400.0);
+        let zoom = 1.0;
+        let pan = egui::Vec2::ZERO;
+        // A point right of and below the image center…
+        let cursor = egui::vec2(100.0, 50.0);
+        let before = cursor - pan;
+
+        let (new_zoom, new_pan) = zoom_step(zoom, pan, 2.0, 8.0, cursor, fitted, viewport);
+
+        assert!((new_zoom - 2.0).abs() < 1e-4);
+        // …must stay put while the image doubles under it.
+        let after = cursor - new_pan;
+        let drift = after - before * (new_zoom / zoom);
+        assert!(
+            drift.x.abs() < 1e-3 && drift.y.abs() < 1e-3,
+            "anchored point moved: {before:?} → {after:?}"
+        );
+    }
+
+    #[test]
+    fn zoom_step_should_snap_back_to_center_when_returning_to_fit() {
+        let viewport = egui::vec2(800.0, 600.0);
+        let fitted = egui::vec2(600.0, 400.0);
+
+        let (zoom, pan) = zoom_step(
+            1.05,
+            egui::vec2(80.0, 0.0),
+            0.5,
+            4.0,
+            egui::Vec2::ZERO,
+            fitted,
+            viewport,
+        );
+
+        assert!((zoom - 1.0).abs() < 1e-6);
+        assert_eq!(pan, egui::Vec2::ZERO);
+    }
+
+    #[test]
+    fn zoom_step_should_clamp_beyond_pixel_parity() {
+        let viewport = egui::vec2(800.0, 600.0);
+        let fitted = egui::vec2(600.0, 400.0);
+
+        let (zoom, _) = zoom_step(
+            4.0,
+            egui::Vec2::ZERO,
+            10.0,
+            4.0,
+            egui::Vec2::ZERO,
+            fitted,
+            viewport,
+        );
+
+        assert!((zoom - 4.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn neighbor_indices_should_walk_both_directions_nearest_first() {
+        let indices: Vec<usize> = neighbor_indices(5, 10, 3).collect();
+        assert_eq!(indices, vec![4, 6, 3, 7, 2, 8]);
+    }
+
+    #[test]
+    fn neighbor_indices_should_clamp_to_set_bounds() {
+        let indices: Vec<usize> = neighbor_indices(0, 3, 3).collect();
+        assert_eq!(indices, vec![1, 2]);
+    }
+
+    #[test]
+    fn max_zoom_should_be_pixel_parity_over_the_fit_rect() {
+        let entry = PhotoEntry {
+            id: cullr_core::PhotoId(1),
+            rel_path: "a.nef".into(),
+            label: cullr_core::Label::None,
+            status: PhotoStatus::Ok,
+            pixels: Some((3000, 2000)),
+            orientation: 1,
+            thumb_path: None,
+            err_msg: None,
+        };
+        // Fit rect is 1500 px wide: 100% needs exactly 2×.
+        assert!((max_zoom(&entry, egui::vec2(1500.0, 1000.0)) - 2.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn max_zoom_should_stay_at_one_for_unknown_pixels() {
+        let entry = PhotoEntry {
+            id: cullr_core::PhotoId(1),
+            rel_path: "a.nef".into(),
+            label: cullr_core::Label::None,
+            status: PhotoStatus::Pending,
+            pixels: None,
+            orientation: 1,
+            thumb_path: None,
+            err_msg: None,
+        };
+        assert_eq!(max_zoom(&entry, egui::vec2(500.0, 500.0)), 1.0);
+    }
+
+    #[test]
+    fn grouped_should_insert_narrow_spaces_every_three_digits() {
+        assert_eq!(grouped(7), "7");
+        assert_eq!(grouped(142), "142");
+        assert_eq!(grouped(3210), "3\u{202f}210");
+        assert_eq!(grouped(1_234_567), "1\u{202f}234\u{202f}567");
+    }
+
+    fn detail(fields: impl FnOnce(&mut PhotoDetail)) -> PhotoDetail {
+        let mut detail = PhotoDetail {
+            id: cullr_core::PhotoId(1),
+            rel_path: "IMG_0001.CR3".into(),
+            label: cullr_core::Label::None,
+            status: PhotoStatus::Ok,
+            pixels: Some((6000, 4000)),
+            orientation: 1,
+            preview_path: None,
+            thumb_path: None,
+            camera: None,
+            lens: None,
+            taken_at: None,
+            shutter: None,
+            aperture: None,
+            iso: None,
+            focal_mm: None,
+            err_msg: None,
+        };
+        fields(&mut detail);
+        detail
+    }
+
+    fn entry() -> PhotoEntry {
+        PhotoEntry {
+            id: cullr_core::PhotoId(1),
+            rel_path: "IMG_0001.CR3".into(),
+            label: cullr_core::Label::None,
+            status: PhotoStatus::Ok,
+            pixels: Some((6000, 4000)),
+            orientation: 1,
+            thumb_path: None,
+            err_msg: None,
+        }
+    }
+
+    #[test]
+    fn exif_line_should_join_present_fields_with_middle_dots() {
+        let detail = detail(|d| {
+            d.camera = Some("Canon EOS R6".to_owned());
+            d.shutter = Some("1/250 s".to_owned());
+            d.iso = Some(400);
+        });
+
+        assert_eq!(
+            exif_line(&detail, &entry()),
+            "Canon EOS R6 · 1/250 s · ISO 400"
+        );
+    }
+
+    #[test]
+    fn exif_line_should_trim_integral_aperture_and_focal_values() {
+        let detail = detail(|d| {
+            d.aperture = Some(8.0);
+            d.focal_mm = Some(35.0);
+        });
+
+        assert_eq!(exif_line(&detail, &entry()), "f/8 · 35mm");
+    }
+
+    #[test]
+    fn exif_line_should_keep_fractional_exposure_values() {
+        let detail = detail(|d| {
+            d.aperture = Some(2.8);
+            d.focal_mm = Some(24.5);
+        });
+
+        assert_eq!(exif_line(&detail, &entry()), "f/2.8 · 24.5mm");
+    }
+
+    #[test]
+    fn exif_line_should_fall_back_to_the_file_name_when_empty() {
+        let detail = detail(|_| {});
+
+        assert_eq!(exif_line(&detail, &entry()), "IMG_0001.CR3");
+    }
+}

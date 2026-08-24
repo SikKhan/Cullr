@@ -37,10 +37,11 @@ enum Event {
     },
 }
 
-/// Which screen is currently mounted.
+/// Which screen is currently mounted. The grid state is boxed: it is by
+/// far the largest variant and swapping screens must stay cheap.
 enum Screen {
     Home(HomeView),
-    Grid(GridView),
+    Grid(Box<GridView>),
 }
 
 /// Root of the UI state machine; owns views and pumps core events per frame.
@@ -104,7 +105,7 @@ impl App {
             pipeline.cancel();
         }
         self.scanning = Some(root.clone());
-        self.screen = Screen::Grid(GridView::new(root.clone()));
+        self.screen = Screen::Grid(Box::new(GridView::new(root.clone())));
         let db = Arc::clone(&self.db);
         let sender = self.events_tx.clone();
         // Scan is a cheap walk + tiny upserts (< 300 ms @ 10k per SPEC §8);
@@ -274,7 +275,7 @@ impl eframe::App for App {
             Screen::Grid(grid) => {
                 let mut action = None;
                 egui::CentralPanel::default().show(ui, |ui| {
-                    action = grid.ui(ui, &mut self.textures);
+                    action = grid.ui(ui, &self.db, &mut self.textures);
                 });
                 self.run_action(action);
             }
