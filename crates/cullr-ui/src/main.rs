@@ -12,6 +12,7 @@ use eframe::egui;
 fn main() -> anyhow::Result<()> {
     init_tracing();
 
+    let initial_folder = parse_initial_folder()?;
     let db = open_index_db()?;
 
     // Window size/position persist across restarts via eframe's own
@@ -30,9 +31,32 @@ fn main() -> anyhow::Result<()> {
     eframe::run_native(
         "Cullr",
         options,
-        Box::new(move |cc| Ok(Box::new(app::App::new(cc, Arc::new(db))))),
+        Box::new(move |cc| {
+            let mut app = app::App::new(cc, Arc::new(db));
+            if let Some(folder) = initial_folder {
+                app.open_folder(folder);
+            }
+            Ok(Box::new(app))
+        }),
     )?;
     Ok(())
+}
+
+/// `cullr [FOLDER]` — an optional positional folder opens straight into the
+/// contact sheet instead of the home screen.
+fn parse_initial_folder() -> anyhow::Result<Option<std::path::PathBuf>> {
+    let Some(arg) = std::env::args().nth(1) else {
+        return Ok(None);
+    };
+    if arg == "-h" || arg == "--help" {
+        println!("usage: cullr [FOLDER]");
+        std::process::exit(0);
+    }
+    let path = std::path::PathBuf::from(arg);
+    if !path.is_dir() {
+        anyhow::bail!("not a directory: {}", path.display());
+    }
+    Ok(Some(path))
 }
 
 /// Opens the global index database at `<cache>/cullr/index.db` (SPEC §4).

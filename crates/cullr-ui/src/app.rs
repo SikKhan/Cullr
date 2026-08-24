@@ -105,7 +105,7 @@ impl App {
     /// Mounts the grid immediately and starts a background scan+sync so
     /// placeholders appear without waiting (SPEC §5.1); any ingest still
     /// running for the previous folder is cancelled up front.
-    fn open_folder(&mut self, root: PathBuf) {
+    pub(crate) fn open_folder(&mut self, root: PathBuf) {
         tracing::info!(?root, "opening folder");
         if let Some(pipeline) = &self.pipeline {
             pipeline.cancel();
