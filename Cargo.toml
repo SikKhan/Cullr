@@ -18,6 +18,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2"
 rusqlite = { version = "0.37", features = ["bundled"] }
 tempfile = "3"
+crossbeam-channel = "0.5"
+dirs = "6"
+rfd = "0.15"
 
 [workspace.lints.rust]
 missing_docs = "deny"
