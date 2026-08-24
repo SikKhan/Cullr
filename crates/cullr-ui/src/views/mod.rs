@@ -6,6 +6,7 @@
 pub mod grid;
 pub mod home;
 pub mod loupe;
+pub mod modals;
 pub mod widgets;
 
 use std::path::PathBuf;
@@ -20,4 +21,6 @@ pub enum Action {
     OpenFolder(PathBuf),
     /// Leave the grid and return Home.
     BackToHome,
+    /// Open the About dialog (SPEC §10 T14).
+    ShowAbout,
 }

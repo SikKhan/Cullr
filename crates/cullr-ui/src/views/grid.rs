@@ -4,7 +4,9 @@
 //! as the viewport fits, drawn through [`egui::ScrollArea::show_rows`] so
 //! only the visible rows (+ egui's built-in margin row) allocate anything.
 //! Cell images are aspect-fit thumbnails streamed in by the texture cache;
-//! pending rows spin, failed rows degrade to error tiles (SPEC §7).
+//! pending rows spin, failed rows degrade to error tiles (SPEC §7). The
+//! cell size lives in one [`CellGeom`] value per frame so the zoom slider
+//! and Ctrl+wheel resize the sheet without touching any other code.
 //!
 //! A [`widgets::LabelFilter`] narrows the sheet through `view`, a list of
 //! positions into the full row set; cursor, loupe navigation and priority
@@ -12,6 +14,12 @@
 //! inside a selection like "red only". Refilters rebuild `view` in one
 //! pass over the rows — microseconds at 10k — and re-anchor the cursor
 //! onto its photo when it survives (SPEC §10 T11).
+//!
+//! Sorting (SPEC §6: filename / capture time) is applied at that same
+//! choke point: [`Self::rebuild_view`] orders the surviving rows before
+//! they become `view`, so arrows, Shift-click ranges and the loupe all
+//! walk the sorted order by construction. Re-sorts re-anchor cursor and
+//! loupe onto their photos by id, exactly like a refilter does.
 //!
 //! Selection is a set of photo ids layered over that cursor (SPEC §6):
 //! click focuses + selects, Ctrl-click toggles, Shift-click ranges from
@@ -38,24 +46,28 @@ use cullr_core::PhotoStatus;
 use super::Action;
 use super::loupe;
 use super::widgets;
+use super::widgets::CHIP_HEIGHT;
 use super::widgets::FilterChip;
 use super::widgets::LabelFilter;
+use super::widgets::SortKey;
 use crate::tex::{TexKey, TextureState, Textures};
 use crate::theme;
 
-/// Cell width; height derives from the default photo aspect.
-const CELL_WIDTH: f32 = 232.0;
+/// Default cell width; height derives from the default photo aspect.
+const CELL_DEFAULT_WIDTH: f32 = 232.0;
+/// Narrowest cell the zoom slider / Ctrl+wheel allow (SPEC §6: 128–1024).
+pub const CELL_MIN_WIDTH: f32 = 128.0;
+/// Widest cell the zoom controls allow.
+pub const CELL_MAX_WIDTH: f32 = 1024.0;
+/// Points of cell growth per point of Ctrl+wheel scroll; a typical notch
+/// (~50 pts) then steps ~25 px, sweeping the range in a few turns.
+const ZOOM_WHEEL_GAIN: f32 = 0.5;
 /// Inner padding between cell border and image area.
 const CELL_PADDING: f32 = 8.0;
 /// Filename strip height inside a tile.
 const STRIP_HEIGHT: f32 = 22.0;
 /// Gap between cells, matching egui's default item spacing we override.
 const GAP: f32 = 8.0;
-/// Fixed image-area height: uniform rows are what keeps `show_rows`
-/// virtualization exact; other aspects letterbox inside this box.
-const IMAGE_HEIGHT: f32 = CELL_WIDTH / cullr_core::DEFAULT_ASPECT;
-/// Total cell height including the filename strip.
-const CELL_HEIGHT: f32 = IMAGE_HEIGHT + STRIP_HEIGHT;
 /// Maximum characters of a filename shown in a tile before truncation.
 const NAME_MAX_CHARS: usize = 26;
 /// Spinner diameter inside cells.
@@ -76,6 +88,44 @@ const NAV_KEYS: [egui::Key; 4] = [
 /// own click slop so the two never disagree.
 const MARQUEE_MIN_DRAG: f32 = 6.0;
 
+/// Cell metrics for one frame: everything about tile layout derives from
+/// the zoomable width, so the slider and wheel change one number here and
+/// the whole sheet follows (SPEC §6 zoom, 128–1024 px cells).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct CellGeom {
+    /// Long-edge cell width in logical points.
+    pub width: f32,
+    /// Total cell height including the filename strip.
+    height: f32,
+}
+
+impl CellGeom {
+    /// Derives the full geometry from the zoomable long edge.
+    pub fn new(width: f32) -> Self {
+        let width = width.clamp(CELL_MIN_WIDTH, CELL_MAX_WIDTH);
+        // Uniform rows are what keeps `show_rows` virtualization exact;
+        // other aspects letterbox inside this box.
+        let height = width / cullr_core::DEFAULT_ASPECT + STRIP_HEIGHT;
+        Self { width, height }
+    }
+
+    /// Horizontal distance between two neighboring cell origins.
+    fn stride_x(self) -> f32 {
+        self.width + GAP
+    }
+
+    /// Vertical distance between two neighboring cell rows.
+    fn stride_y(self) -> f32 {
+        self.height + GAP
+    }
+}
+
+impl Default for CellGeom {
+    fn default() -> Self {
+        Self::new(CELL_DEFAULT_WIDTH)
+    }
+}
+
 /// State of the Grid screen for the folder being browsed.
 pub struct GridView {
     root: PathBuf,
@@ -88,6 +138,16 @@ pub struct GridView {
     /// addresses this view, never the raw row set.
     view: Vec<usize>,
     filter: LabelFilter,
+    /// Display order of the sheet (SPEC §6); applied inside
+    /// [`Self::rebuild_view`] so every consumer shares one order.
+    sort: SortKey,
+    /// Capture-time stamps by photo id for [`SortKey::TakenAt`], filled
+    /// lazily from point queries; photos absent from the map have not
+    /// been looked up yet. `None` values sort last.
+    taken_at: HashMap<PhotoId, Option<String>>,
+    /// Sort order queued by a pill click this frame, applied after the
+    /// bars are drawn (the stamp cache needs the db handle from `ui`).
+    pending_sort: Option<SortKey>,
     loading: bool,
     error: Option<String>,
     ingest_total: usize,
@@ -114,6 +174,9 @@ pub struct GridView {
     scroll_target: Option<usize>,
     /// Auto-advance-after-label, persisted across sessions (SPEC §6).
     auto_advance: bool,
+    /// Zoomable cell long edge in points (SPEC §6); geometry per frame
+    /// derives from it via [`CellGeom::new`].
+    cell_width: f32,
     /// Loupe position queued by a keyboard open. Creation waits for the
     /// next frame because the opening keypress must not leak into the
     /// loupe's own handlers (Space would start it zoomed, Enter would
@@ -135,6 +198,9 @@ impl GridView {
             index: HashMap::new(),
             view: Vec::new(),
             filter: LabelFilter::all(),
+            sort: SortKey::default(),
+            taken_at: HashMap::new(),
+            pending_sort: None,
             loading: true,
             error: None,
             ingest_total: 0,
@@ -148,6 +214,7 @@ impl GridView {
             marquee: None,
             scroll_target: None,
             auto_advance,
+            cell_width: CELL_DEFAULT_WIDTH,
             open_requested: None,
             loupe: None,
         }
@@ -165,10 +232,11 @@ impl GridView {
                     .collect();
                 self.entries = entries;
                 // Ids from the replaced row set must not leak into the
-                // fresh folder's batches or counts.
+                // fresh folder's batches, counts or stamp cache.
                 self.selection.clear();
                 self.anchor = None;
                 self.marquee = None;
+                self.taken_at.clear();
                 self.rebuild_view();
                 // Keys must work before any click, so the cursor arms on
                 // the first tile as soon as the folder resolves.
@@ -230,17 +298,24 @@ impl GridView {
     }
 
     /// Draws the screen and reports the user's action, if any.
+    ///
+    /// `suspended` is set while a modal dialog (help overlay, About) is
+    /// up: the sheet keeps painting — so the dimmed backdrop shows real
+    /// content — but every key, wheel and rubber-band path stays quiet,
+    /// and clicks are already claimed by the topmost modal layer.
     pub fn ui(
         &mut self,
         ui: &mut egui::Ui,
         db: &cullr_core::Db,
         textures: &mut Textures,
+        suspended: bool,
     ) -> Option<Action> {
         let mut action = None;
-        let columns = columns_for_width(ui.available_width()).max(1);
+        let geom = CellGeom::new(self.cell_width);
+        let columns = columns_for_width(ui.available_width(), geom).max(1);
         // Mount a loupe queued last frame before any input handling, so
         // its first drawn frame starts with fresh key state.
-        if self.loupe.is_none() {
+        if self.loupe.is_none() && !suspended {
             self.loupe = self.open_requested.take().map(loupe::LoupeView::at);
         }
         // Keyboard-first navigation. While the loupe is up it owns every
@@ -250,9 +325,10 @@ impl GridView {
         // Esc works on every mounted sheet state — including scan-error,
         // empty-folder and filtered-to-nothing, whose notices all promise
         // it — while the movement keys need tiles to move across.
-        let escape =
-            self.loupe.is_none() && ui.ctx().input(|input| input.key_pressed(egui::Key::Escape));
-        let sheet_keys = self.loupe.is_none() && !self.view.is_empty();
+        let escape = self.loupe.is_none()
+            && !suspended
+            && ui.ctx().input(|input| input.key_pressed(egui::Key::Escape));
+        let sheet_keys = self.loupe.is_none() && !self.view.is_empty() && !suspended;
         let (enter, space, nav) = if sheet_keys {
             ui.ctx().input(|input| {
                 (
@@ -278,9 +354,9 @@ impl GridView {
         };
         // The filter preset key works everywhere in the folder, loupe
         // included, so "show me only what I marked" is one press away.
-        if !self.loading && ui.ctx().input(|input| input.key_pressed(egui::Key::F)) {
+        if !self.loading && !suspended && ui.ctx().input(|input| input.key_pressed(egui::Key::F)) {
             self.filter.cycle_preset();
-            self.refilter();
+            self.apply_order_change();
         }
         if escape {
             action = Some(Action::BackToHome);
@@ -327,7 +403,19 @@ impl GridView {
                 self.filter_bar(ui, &tally);
             });
         }
-        egui::CentralPanel::default().show(ui, |ui| self.body(ui, db, textures, columns));
+        egui::CentralPanel::default()
+            .show(ui, |ui| self.body(ui, db, textures, columns, suspended));
+
+        // A sort picked in the bar applies here, where the db handle is
+        // at hand for the stamp cache; re-anchoring keeps the cursor on
+        // its photo through the reorder.
+        if let Some(sort) = self.pending_sort.take() {
+            self.sort = sort;
+            if sort == SortKey::TakenAt {
+                self.refresh_taken_at(db);
+            }
+            self.apply_order_change();
+        }
 
         action
     }
@@ -416,22 +504,41 @@ impl GridView {
         !self.loading && self.error.is_none() && !self.entries.is_empty()
     }
 
-    /// Filter bar row: chips with live per-label counts; clicks refilter
-    /// immediately (SPEC §6).
+    /// Filter bar row: chips with live per-label counts on the left; the
+    /// zoom slider (SPEC §6) and sort pill on the right. Clicks and drags
+    /// refilter / resize / reorder immediately.
     fn filter_bar(&mut self, ui: &mut egui::Ui, tally: &Tally) {
         ui.add_space(3.0);
         let picked = widgets::filter_chips(ui, self.filter, &tally.counts);
         match picked {
             Some(FilterChip::All) => {
                 self.filter.clear();
-                self.refilter();
+                self.apply_order_change();
             }
             Some(FilterChip::Label(label)) => {
                 self.filter.toggle(label);
-                self.refilter();
+                self.apply_order_change();
             }
             None => {}
         }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // The order swap is queued, not applied in place: applying it
+            // needs the db for the stamp cache, which only `ui` holds.
+            if let Some(sort) = widgets::sort_pill(ui, self.sort) {
+                self.pending_sort = Some(sort);
+            }
+            ui.separator();
+            ui.spacing_mut().interact_size.y = CHIP_HEIGHT;
+            let slider = egui::Slider::new(&mut self.cell_width, CELL_MIN_WIDTH..=CELL_MAX_WIDTH)
+                .show_value(false);
+            let cell = ui.add(slider);
+            let resized = cell.changed();
+            // `on_hover_text` consumes the response; read it first.
+            cell.on_hover_text("Cell size — Ctrl+wheel over the sheet also zooms");
+            if resized {
+                self.cell_width = CellGeom::new(self.cell_width).width;
+            }
+        });
         ui.add_space(3.0);
     }
 
@@ -450,15 +557,17 @@ impl GridView {
         Tally { counts, errors }
     }
 
-    /// Rebuilds the filtered view from the current filter state and
-    /// re-anchors cursor and loupe onto their photos. Photos that survive
-    /// stay under the user's hands at their new position; a photo that
-    /// fell out of the loupe's order closes it back to the sheet.
+    /// Rebuilds the view after filter or sort state changed and re-anchors
+    /// cursor and loupe onto their photos. Photos that survive stay under
+    /// the user's hands at their new position — whether they moved because
+    /// a chip hid their neighbors or because the order flipped (SPEC §6);
+    /// a photo that fell out of the loupe's order closes it back to the
+    /// sheet.
     ///
     /// Membership deliberately ignores later label edits: relabeling a
     /// tile never yanks it out from under the cursor mid-cull-pass — the
     /// next explicit refilter (chip click / `F`) refreshes the set.
-    fn refilter(&mut self) {
+    fn apply_order_change(&mut self) {
         let anchor_row = self
             .cursor
             .and_then(|cursor| self.view.get(cursor))
@@ -481,7 +590,7 @@ impl GridView {
                 .map(|position| position.min(self.view.len() - 1)),
         };
         if self.cursor.is_none() && !self.view.is_empty() {
-            // A refilter that brings tiles back arms the cursor so keys
+            // A change that brings tiles back arms the cursor so keys
             // work without a click, mirroring apply_scan.
             self.cursor = Some(0);
         }
@@ -498,16 +607,77 @@ impl GridView {
         }
     }
 
-    /// Recomputes the filtered view: one branchy pass over the rows.
+    /// Recomputes the filtered, sorted view: one branchy pass over the
+    /// rows collecting survivors, then an in-memory sort of those rows by
+    /// the active [`SortKey`]. This is the single choke point for display
+    /// order — arrows, shift-click ranges and loupe navigation all read
+    /// `view`, so they follow the sort for free (SPEC §6).
+    ///
+    /// Sorts decorate-style, computing each key once: comparators must
+    /// stay allocation-free to hold the refilter budget at 10k rows.
     fn rebuild_view(&mut self) {
         let filter = self.filter;
-        self.view = self
+        let survivors: Vec<usize> = self
             .entries
             .iter()
             .enumerate()
             .filter(|(_, entry)| filter.matches(entry.label))
             .map(|(row, _)| row)
             .collect();
+        match self.sort {
+            SortKey::FileName => {
+                // Case-insensitive so mixed-case card dumps interleave
+                // naturally; the full rel_path breaks ties deterministically.
+                let mut keyed: Vec<(String, usize)> = survivors
+                    .into_iter()
+                    .map(|row| (file_name(&self.entries[row]).to_lowercase(), row))
+                    .collect();
+                keyed.sort_by(|a, b| {
+                    a.0.cmp(&b.0)
+                        .then_with(|| self.entries[a.1].rel_path.cmp(&self.entries[b.1].rel_path))
+                });
+                self.view = keyed.into_iter().map(|(_, row)| row).collect();
+            }
+            SortKey::TakenAt => {
+                // Stamps are ISO-shaped display strings (`2024-05-01
+                // 12:33:44`), so lexicographic order is chronological.
+                // Missing stamps rank last; filename breaks ties.
+                let mut keyed: Vec<(bool, &str, usize)> = survivors
+                    .into_iter()
+                    .map(|row| {
+                        let stamp = self
+                            .taken_at
+                            .get(&self.entries[row].id)
+                            .and_then(|stamp| stamp.as_deref());
+                        (stamp.is_none(), stamp.unwrap_or(""), row)
+                    })
+                    .collect();
+                keyed.sort_by(|a, b| {
+                    a.0.cmp(&b.0)
+                        .then(a.1.cmp(b.1))
+                        .then_with(|| self.entries[a.2].rel_path.cmp(&self.entries[b.2].rel_path))
+                });
+                self.view = keyed.into_iter().map(|(_, _, row)| row).collect();
+            }
+        }
+    }
+
+    /// Fetches capture-time stamps for every row missing from the cache,
+    /// degrading to "unknown" on read errors so sorting still works. Only
+    /// called when [`SortKey::TakenAt`] is active; point queries are
+    /// microsecond-scale (same path as the loupe's EXIF bar).
+    fn refresh_taken_at(&mut self, db: &cullr_core::Db) {
+        for entry in &self.entries {
+            if self.taken_at.contains_key(&entry.id) {
+                continue;
+            }
+            let stamp = db
+                .photo_detail(entry.id)
+                .ok()
+                .flatten()
+                .and_then(|detail| detail.taken_at);
+            self.taken_at.insert(entry.id, stamp);
+        }
     }
 
     /// Moves the cursor to the next extraction-error tile in view order,
@@ -538,6 +708,7 @@ impl GridView {
         db: &cullr_core::Db,
         textures: &mut Textures,
         columns: usize,
+        suspended: bool,
     ) {
         if let Some(active) = self.loupe.as_mut() {
             // The loupe mutates the sheet's rows in place (labels land in
@@ -551,6 +722,7 @@ impl GridView {
                 &self.view,
                 textures,
                 &mut self.auto_advance,
+                suspended,
             );
             if outcome == loupe::Outcome::Close {
                 // Resume sheet navigation where the preview left off.
@@ -623,7 +795,7 @@ impl GridView {
             return;
         }
 
-        self.draw_sheet(ui, textures, columns);
+        self.draw_sheet(ui, textures, columns, suspended);
     }
 
     /// Applies a digit label to the photo under the cursor: instant
@@ -714,6 +886,7 @@ impl GridView {
         origin: Option<egui::Pos2>,
         columns: usize,
         viewport: egui::Rect,
+        geom: CellGeom,
     ) -> bool {
         let Some(origin) = origin else {
             return false;
@@ -746,7 +919,7 @@ impl GridView {
         };
         if released {
             let dragging = marquee.dragging;
-            let on_tile = point_on_tile(origin, marquee.start, columns, self.view.len());
+            let on_tile = point_on_tile(origin, marquee.start, columns, self.view.len(), geom);
             self.selection = std::mem::take(&mut marquee.base);
             if dragging {
                 // The band owns the final word on the set; swallow the
@@ -772,7 +945,7 @@ impl GridView {
         if marquee.dragging {
             let band = egui::Rect::from_two_pos(marquee.start, latest);
             let covered: HashSet<PhotoId> =
-                covered_positions(origin, band, columns, self.view.len())
+                covered_positions(origin, band, columns, self.view.len(), geom)
                     .filter_map(|position| self.id_at(position))
                     .collect();
             self.selection = if marquee.additive {
@@ -809,12 +982,41 @@ impl GridView {
     /// margin row, added by `show_rows`) allocate widgets or textures.
     /// Cells walk the filtered `view`, so hidden photos cost nothing.
     ///
+    /// Ctrl+wheel over the sheet resizes the cells (SPEC §6 zoom) instead
+    /// of scrolling; plain wheel keeps its scroll behavior.
+    ///
     /// The visible id set feeds the texture manager's focus (scroll-driven
     /// decode cancellation) and a band of neighbouring rows is prefetched,
     /// both after drawing so they see the settled viewport.
-    fn draw_sheet(&mut self, ui: &mut egui::Ui, textures: &mut Textures, columns: usize) {
+    fn draw_sheet(
+        &mut self,
+        ui: &mut egui::Ui,
+        textures: &mut Textures,
+        columns: usize,
+        suspended: bool,
+    ) {
+        let geom = CellGeom::new(self.cell_width);
         ui.spacing_mut().item_spacing = egui::vec2(GAP, GAP);
         let total_rows = self.view.len().div_ceil(columns);
+        // Zoom takes the wheel before the scroll area sees it: with Ctrl
+        // held and the pointer over the sheet, the delta drives the cell
+        // size and is zeroed out so the sheet does not also scroll.
+        if !suspended {
+            let (wheel_zooming, scroll_y, pointer) = ui.input(|input| {
+                (
+                    input.modifiers.command,
+                    input.smooth_scroll_delta.y,
+                    input.pointer.hover_pos(),
+                )
+            });
+            if wheel_zooming
+                && scroll_y != 0.0
+                && pointer.is_some_and(|pointer| ui.max_rect().contains(pointer))
+            {
+                self.cell_width = zoomed_cell_width(self.cell_width, scroll_y);
+                ui.input_mut(|input| input.smooth_scroll_delta = egui::Vec2::ZERO);
+            }
+        }
         let view = &self.view;
         let entries = &self.entries;
         let selection = &self.selection;
@@ -831,12 +1033,12 @@ impl GridView {
         // of the target row is computed and applied exactly once.
         let mut scroll = egui::ScrollArea::vertical().auto_shrink(false);
         if let Some(row) = self.scroll_target.take() {
-            let content_height = total_rows.max(1) as f32 * CELL_HEIGHT + GAP;
+            let content_height = total_rows.max(1) as f32 * geom.stride_y() + GAP;
             let centered =
-                row as f32 * (CELL_HEIGHT + GAP) + CELL_HEIGHT / 2.0 - ui.available_height() / 2.0;
+                row as f32 * geom.stride_y() + geom.height / 2.0 - ui.available_height() / 2.0;
             scroll = scroll.vertical_scroll_offset(centered.clamp(0.0, content_height));
         }
-        let output = scroll.show_rows(ui, CELL_HEIGHT, total_rows, |ui, rows| {
+        let output = scroll.show_rows(ui, geom.height, total_rows, |ui, rows| {
             rows_shown = rows.clone();
             for row in rows {
                 ui.horizontal(|ui| {
@@ -853,6 +1055,7 @@ impl GridView {
                             ui,
                             textures,
                             entry,
+                            geom,
                             cursor == Some(position),
                             selection.contains(&entry.id),
                             &mut visible_pending,
@@ -884,14 +1087,20 @@ impl GridView {
 
         // Rubber band first so a finished drag can swallow the release
         // that would otherwise land on a tile as a click (SPEC §6).
-        let origin = first_tile.map(|(position, rect)| tile_origin(position, rect, columns));
-        let release_consumed = self.step_marquee(ui, origin, columns, viewport);
+        let origin = first_tile.map(|(position, rect)| tile_origin(position, rect, columns, geom));
+        let release_consumed = if suspended {
+            false
+        } else {
+            self.step_marquee(ui, origin, columns, viewport, geom)
+        };
         self.paint_marquee(ui);
 
         // Mouse path to the loupe is a double-click now that plain click
         // selects; it mounts next frame like keyboard opens so the
-        // second click never leaks into the preview (SPEC §6).
-        if !release_consumed {
+        // second click never leaks into the preview (SPEC §6). Under a
+        // modal the clicks belong to its layer anyway; the guard makes
+        // that independent of egui's hit-testing.
+        if !release_consumed && !suspended {
             if let Some(position) = double_clicked {
                 self.cursor = Some(position);
                 self.anchor = Some(position);
@@ -1030,12 +1239,13 @@ fn draw_cell(
     ui: &mut egui::Ui,
     textures: &mut Textures,
     entry: &PhotoEntry,
+    geom: CellGeom,
     is_cursor: bool,
     is_selected: bool,
     visible_pending: &mut Vec<PhotoId>,
 ) -> CellHit {
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(CELL_WIDTH, CELL_HEIGHT), egui::Sense::click());
+        ui.allocate_exact_size(egui::vec2(geom.width, geom.height), egui::Sense::click());
     ui.painter().rect_filled(rect, 6.0, theme::PANEL);
     if is_selected {
         // Quieter than the cursor ring so a large batch reads as one
@@ -1180,8 +1390,15 @@ fn draw_strip(painter: &egui::Painter, cell: egui::Rect, entry: &PhotoEntry) {
 }
 
 /// Number of whole cells that fit in `width`, accounting for gaps.
-fn columns_for_width(width: f32) -> usize {
-    ((width + GAP) / (CELL_WIDTH + GAP)).floor().max(0.0) as usize
+fn columns_for_width(width: f32, geom: CellGeom) -> usize {
+    ((width + GAP) / geom.stride_x()).floor().max(0.0) as usize
+}
+
+/// Cell long edge after one Ctrl+wheel step (SPEC §6 zoom): the scroll
+/// delta scales the width linearly, clamped to the 128–1024 range. Pure
+/// so the wheel gain is unit-testable.
+pub(crate) fn zoomed_cell_width(current: f32, scroll_y: f32) -> f32 {
+    (current + scroll_y * ZOOM_WHEEL_GAIN).clamp(CELL_MIN_WIDTH, CELL_MAX_WIDTH)
 }
 
 /// Cursor position after an arrow press: left/right step by one, up/down
@@ -1203,25 +1420,25 @@ fn stepped_cursor(cursor: usize, key: egui::Key, columns: usize, len: usize) -> 
 /// geometry, derived from any one allocated tile — a tile's rect is exact
 /// even when half scrolled out of view, so the marquee never depends on
 /// scroll-area internals. Pure so the mapping is unit-testable.
-fn tile_origin(position: usize, rect: egui::Rect, columns: usize) -> egui::Pos2 {
+fn tile_origin(position: usize, rect: egui::Rect, columns: usize, geom: CellGeom) -> egui::Pos2 {
     let row = (position / columns.max(1)) as f32;
     let column = (position % columns.max(1)) as f32;
     egui::pos2(
-        rect.left() - column * (CELL_WIDTH + GAP),
-        rect.top() - row * (CELL_HEIGHT + GAP),
+        rect.left() - column * geom.stride_x(),
+        rect.top() - row * geom.stride_y(),
     )
 }
 
 /// Rect of the tile at `position` in unbounded sheet geometry.
-fn tile_rect(origin: egui::Pos2, position: usize, columns: usize) -> egui::Rect {
+fn tile_rect(origin: egui::Pos2, position: usize, columns: usize, geom: CellGeom) -> egui::Rect {
     let row = (position / columns.max(1)) as f32;
     let column = (position % columns.max(1)) as f32;
     egui::Rect::from_min_size(
         egui::pos2(
-            origin.x + column * (CELL_WIDTH + GAP),
-            origin.y + row * (CELL_HEIGHT + GAP),
+            origin.x + column * geom.stride_x(),
+            origin.y + row * geom.stride_y(),
         ),
-        egui::vec2(CELL_WIDTH, CELL_HEIGHT),
+        egui::vec2(geom.width, geom.height),
     )
 }
 
@@ -1233,9 +1450,10 @@ fn position_at_point(
     point: egui::Pos2,
     columns: usize,
     len: usize,
+    geom: CellGeom,
 ) -> Option<usize> {
-    let column = ((point.x - origin.x) / (CELL_WIDTH + GAP)).floor();
-    let row = ((point.y - origin.y) / (CELL_HEIGHT + GAP)).floor();
+    let column = ((point.x - origin.x) / geom.stride_x()).floor();
+    let row = ((point.y - origin.y) / geom.stride_y()).floor();
     if len == 0 || column < 0.0 || row < 0.0 {
         return None;
     }
@@ -1246,9 +1464,15 @@ fn position_at_point(
 /// `true` when the point sits inside some tile's rectangle; gaps between
 /// cells and the space below the last row count as bare sheet, which is
 /// what makes click-on-empty clear the selection (SPEC §6).
-fn point_on_tile(origin: egui::Pos2, point: egui::Pos2, columns: usize, len: usize) -> bool {
-    position_at_point(origin, point, columns, len)
-        .is_some_and(|position| tile_rect(origin, position, columns).contains(point))
+fn point_on_tile(
+    origin: egui::Pos2,
+    point: egui::Pos2,
+    columns: usize,
+    len: usize,
+    geom: CellGeom,
+) -> bool {
+    position_at_point(origin, point, columns, len, geom)
+        .is_some_and(|position| tile_rect(origin, position, columns, geom).contains(point))
 }
 
 /// Every tile position whose rectangle intersects `band`, clamped to the
@@ -1259,20 +1483,21 @@ fn covered_positions(
     band: egui::Rect,
     columns: usize,
     len: usize,
+    geom: CellGeom,
 ) -> impl Iterator<Item = usize> {
     let columns = columns.max(1);
-    let step_x = CELL_WIDTH + GAP;
-    let step_y = CELL_HEIGHT + GAP;
+    let step_x = geom.stride_x();
+    let step_y = geom.stride_y();
     // A tile counts when its rect merely touches the band, hence the
     // size offsets on the leading edges.
-    let first_column = (((band.left() - origin.x - CELL_WIDTH) / step_x)
+    let first_column = (((band.left() - origin.x - geom.width) / step_x)
         .ceil()
         .max(0.0)) as usize;
     // Inclusive bounds clamped to the sheet's own shape: a wider band
     // would only wrap columns into duplicate positions.
     let last_column = ((((band.right() - origin.x) / step_x).floor().max(0.0)) as usize)
         .min(first_column + columns - 1);
-    let first_row = (((band.top() - origin.y - CELL_HEIGHT) / step_y)
+    let first_row = (((band.top() - origin.y - geom.height) / step_y)
         .ceil()
         .max(0.0)) as usize;
     let last_row = ((((band.bottom() - origin.y) / step_y).floor().max(0.0)) as usize)
@@ -1332,18 +1557,52 @@ mod tests {
 
     #[test]
     fn columns_for_width_should_fit_whole_cells_only() {
+        let geom = CellGeom::default();
         // Two cells plus one gap need exactly 232 * 2 + 8 = 472 px.
-        assert_eq!(columns_for_width(472.0), 2);
+        assert_eq!(columns_for_width(472.0, geom), 2);
         // One pixel short must not promise a second column.
-        assert_eq!(columns_for_width(471.0), 1);
+        assert_eq!(columns_for_width(471.0, geom), 1);
         // A third cell would need 712 px.
-        assert_eq!(columns_for_width(711.0), 2);
+        assert_eq!(columns_for_width(711.0, geom), 2);
     }
 
     #[test]
     fn columns_for_width_should_report_zero_for_zero_width() {
         // Callers clamp to one column; the pure function stays honest.
-        assert_eq!(columns_for_width(0.0), 0);
+        assert_eq!(columns_for_width(0.0, CellGeom::default()), 0);
+    }
+
+    #[test]
+    fn columns_for_width_should_follow_the_zoomed_cell_size() {
+        // Half-size tiles must fit strictly more columns into the same
+        // viewport; exact doubling does not survive column flooring.
+        let geom = CellGeom::new(CELL_DEFAULT_WIDTH / 2.0);
+
+        assert!(
+            columns_for_width(472.0, geom) > columns_for_width(472.0, CellGeom::default()),
+            "smaller cells mean a denser sheet"
+        );
+    }
+
+    #[test]
+    fn cell_geom_should_clamp_width_to_the_zoom_range() {
+        assert_eq!(CellGeom::new(10.0).width, CELL_MIN_WIDTH);
+        assert_eq!(CellGeom::new(f32::MAX).width, CELL_MAX_WIDTH);
+        assert_eq!(CellGeom::default().width, CELL_DEFAULT_WIDTH);
+    }
+
+    #[test]
+    fn zoomed_cell_width_should_scale_with_wheel_delta_and_clamp() {
+        assert_eq!(
+            zoomed_cell_width(CELL_DEFAULT_WIDTH, -100.0),
+            CELL_DEFAULT_WIDTH - 50.0
+        );
+        assert_eq!(
+            zoomed_cell_width(CELL_DEFAULT_WIDTH, 40.0),
+            CELL_DEFAULT_WIDTH + 20.0
+        );
+        assert_eq!(zoomed_cell_width(CELL_MIN_WIDTH, -10_000.0), CELL_MIN_WIDTH);
+        assert_eq!(zoomed_cell_width(CELL_MAX_WIDTH, 10_000.0), CELL_MAX_WIDTH);
     }
 
     #[test]
@@ -1450,13 +1709,13 @@ mod tests {
     fn apply_scan_should_arm_cursor_on_first_visible_tile() {
         let mut grid = grid_with(&[TestLabel::None]);
         grid.filter = LabelFilter::labeled();
-        grid.refilter();
+        grid.apply_order_change();
 
         assert!(grid.view.is_empty());
         assert_eq!(grid.cursor, None);
 
         grid.filter = LabelFilter::all();
-        grid.refilter();
+        grid.apply_order_change();
 
         assert_eq!(grid.view.len(), 1);
         assert_eq!(grid.cursor, Some(0));
@@ -1467,11 +1726,11 @@ mod tests {
         let mut grid = grid_with(&[TestLabel::None, TestLabel::Red, TestLabel::None]);
 
         grid.filter.toggle(TestLabel::Red);
-        grid.refilter();
+        grid.apply_order_change();
 
         assert_eq!(grid.view, vec![1]);
         grid.filter.clear();
-        grid.refilter();
+        grid.apply_order_change();
 
         assert_eq!(grid.view, vec![0, 1, 2]);
     }
@@ -1481,7 +1740,7 @@ mod tests {
         let mut grid = grid_with(&[TestLabel::None, TestLabel::Red]);
         grid.cursor = Some(1);
         grid.filter.toggle(TestLabel::Red);
-        grid.refilter();
+        grid.apply_order_change();
 
         // The red photo moved from view slot 1 to slot 0 but keeps the
         // cursor; digits keep landing on the same tile.
@@ -1493,7 +1752,7 @@ mod tests {
         let mut grid = grid_with(&[TestLabel::None, TestLabel::None, TestLabel::None]);
         grid.cursor = Some(2);
         grid.filter.toggle(TestLabel::Red);
-        grid.refilter();
+        grid.apply_order_change();
 
         assert_eq!(grid.cursor, None);
     }
@@ -1538,7 +1797,7 @@ mod tests {
 
         assert_eq!(grid.stats_line(), "2 photos");
         grid.filter.toggle(TestLabel::Red);
-        grid.refilter();
+        grid.apply_order_change();
 
         assert_eq!(grid.stats_line(), "1 / 2 shown");
     }
@@ -1581,27 +1840,30 @@ mod tests {
     fn position_at_point_should_map_points_to_tiles_and_reject_off_sheet_points() {
         let columns = 3;
         let origin = egui::pos2(100.0, 50.0);
+        let geom = CellGeom::default();
 
         assert_eq!(
-            position_at_point(origin, egui::pos2(100.0, 50.0), columns, 7),
+            position_at_point(origin, egui::pos2(100.0, 50.0), columns, 7, geom),
             Some(0),
             "the sheet origin is tile zero's corner"
         );
         assert_eq!(
             position_at_point(
                 origin,
-                egui::pos2(100.0 + CELL_WIDTH + GAP + 1.0, 60.0),
+                egui::pos2(100.0 + geom.width + GAP + 1.0, 60.0),
                 columns,
-                7
+                7,
+                geom
             ),
             Some(1)
         );
         assert_eq!(
             position_at_point(
                 origin,
-                egui::pos2(110.0, 50.0 + CELL_HEIGHT + GAP + 1.0),
+                egui::pos2(110.0, 50.0 + geom.height + GAP + 1.0),
                 columns,
-                7
+                7,
+                geom
             ),
             Some(3),
             "one row down steps by the column count"
@@ -1609,19 +1871,20 @@ mod tests {
         assert_eq!(
             position_at_point(
                 origin,
-                egui::pos2(100.0 + 3.0 * (CELL_WIDTH + GAP) + 5.0, 60.0),
+                egui::pos2(100.0 + 3.0 * (geom.width + GAP) + 5.0, 60.0),
                 columns,
-                2
+                2,
+                geom
             ),
             None,
             "past the last tile there is nothing to address"
         );
         assert_eq!(
-            position_at_point(origin, egui::pos2(50.0, 60.0), columns, 7),
+            position_at_point(origin, egui::pos2(50.0, 60.0), columns, 7, geom),
             None
         );
         assert_eq!(
-            position_at_point(origin, egui::pos2(120.0, 10.0), columns, 7),
+            position_at_point(origin, egui::pos2(120.0, 10.0), columns, 7, geom),
             None
         );
     }
@@ -1630,23 +1893,32 @@ mod tests {
     fn point_on_tile_should_exclude_gaps_and_trailing_space() {
         let columns = 2;
         let origin = egui::Pos2::ZERO;
+        let geom = CellGeom::default();
 
         assert!(point_on_tile(
             origin,
-            egui::pos2(CELL_WIDTH - 1.0, CELL_HEIGHT - 1.0),
+            egui::pos2(geom.width - 1.0, geom.height - 1.0),
             columns,
-            4
+            4,
+            geom
         ));
         assert!(
-            !point_on_tile(origin, egui::pos2(CELL_WIDTH + GAP / 2.0, 5.0), columns, 4),
+            !point_on_tile(
+                origin,
+                egui::pos2(geom.width + GAP / 2.0, 5.0),
+                columns,
+                4,
+                geom
+            ),
             "the gap between cells is bare sheet"
         );
         // One row down with only one row of tiles: bare space.
         assert!(!point_on_tile(
             origin,
-            egui::pos2(5.0, CELL_HEIGHT + GAP + 1.0),
+            egui::pos2(5.0, geom.height + GAP + 1.0),
             columns,
-            2
+            2,
+            geom
         ));
     }
 
@@ -1654,13 +1926,14 @@ mod tests {
     fn covered_positions_should_take_every_intersecting_tile() {
         let columns = 3;
         let origin = egui::Pos2::ZERO;
+        let geom = CellGeom::default();
         // A small band straddling the corner shared by tiles 0, 1, 3, 4.
         let band = egui::Rect::from_min_max(
-            egui::pos2(CELL_WIDTH - 2.0, CELL_HEIGHT - 2.0),
-            egui::pos2(CELL_WIDTH + GAP + 2.0, CELL_HEIGHT + GAP + 2.0),
+            egui::pos2(geom.width - 2.0, geom.height - 2.0),
+            egui::pos2(geom.width + GAP + 2.0, geom.height + GAP + 2.0),
         );
 
-        let covered: Vec<usize> = covered_positions(origin, band, columns, 9).collect();
+        let covered: Vec<usize> = covered_positions(origin, band, columns, 9, geom).collect();
 
         assert_eq!(covered, vec![0, 1, 3, 4]);
     }
@@ -1671,7 +1944,10 @@ mod tests {
         let origin = egui::Pos2::ZERO;
         let band = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(10_000.0, 10_000.0));
 
-        assert_eq!(covered_positions(origin, band, columns, 7).count(), 7);
+        assert_eq!(
+            covered_positions(origin, band, columns, 7, CellGeom::default()).count(),
+            7
+        );
     }
 
     #[test]
@@ -1684,7 +1960,7 @@ mod tests {
     fn select_all_should_cover_only_the_filtered_view() {
         let mut grid = grid_with(&[TestLabel::None, TestLabel::Red, TestLabel::None]);
         grid.filter.toggle(TestLabel::Red);
-        grid.refilter();
+        grid.apply_order_change();
 
         grid.select_all();
 
@@ -1700,7 +1976,7 @@ mod tests {
         grid.select_all();
         grid.filter.toggle(TestLabel::Red);
 
-        grid.refilter();
+        grid.apply_order_change();
 
         assert_eq!(grid.view.len(), 1);
         assert_eq!(grid.selection.len(), 2, "ids outlive their hiding");
@@ -1779,5 +2055,107 @@ mod tests {
         grid.select_all();
 
         assert_eq!(grid.stats_line(), "2 photos · 2 selected");
+    }
+
+    // --- sorting (SPEC §10 T14) ---
+
+    /// Grid whose rows sit in deliberately shuffled scan order so both
+    /// sort keys have something to reorder; names follow ids, so the
+    /// display order under filename sort is exactly id order.
+    fn grid_shuffled() -> GridView {
+        let mut grid = grid_with(&[
+            TestLabel::None, // IMG_0001
+            TestLabel::Red,  // IMG_0002
+            TestLabel::None, // IMG_0003
+            TestLabel::None, // IMG_0004
+            TestLabel::None, // IMG_0005
+        ]);
+        let shuffled: Vec<PhotoEntry> = [4_usize, 0, 3, 1, 2]
+            .iter()
+            .map(|&row| grid.entries[row].clone())
+            .collect();
+        grid.entries = shuffled;
+        for (index, entry) in grid.entries.iter().enumerate() {
+            grid.index.insert(entry.id, index);
+        }
+        grid.apply_order_change();
+        grid
+    }
+
+    /// Capture-time stamps by photo id, as `refresh_taken_at` would cache.
+    fn stamp(grid: &mut GridView, id: u64, taken_at: &str) {
+        grid.taken_at
+            .insert(cullr_core::PhotoId(id), Some(taken_at.to_owned()));
+    }
+
+    #[test]
+    fn filename_sort_should_order_rows_by_name_ignoring_scan_order() {
+        let mut grid = grid_shuffled();
+        grid.sort = SortKey::FileName;
+
+        grid.apply_order_change();
+
+        // Shuffled scan order maps names to rows as
+        //   IMG_0001→1 · IMG_0002→3 · IMG_0003→4 · IMG_0004→2 · IMG_0005→0,
+        // so name order visits exactly those rows.
+        assert_eq!(grid.view, vec![1, 3, 4, 2, 0]);
+    }
+
+    #[test]
+    fn taken_at_sort_should_order_chronologically_and_put_unknowns_last() {
+        let mut grid = grid_shuffled();
+        grid.sort = SortKey::TakenAt;
+        stamp(&mut grid, 1, "2024-05-01 10:00:00");
+        stamp(&mut grid, 2, "2024-05-01 08:00:00");
+        stamp(&mut grid, 4, "2024-05-01 09:00:00");
+        // Ids 3 and 5 carry no stamp and must land after all stamped ones.
+
+        grid.apply_order_change();
+
+        // Chronological: 08:00 (row 3) → 09:00 (row 2) → 10:00 (row 1);
+        // unknowns trail in filename order (rows 4, 0).
+        assert_eq!(grid.view, vec![3, 2, 1, 4, 0]);
+    }
+
+    #[test]
+    fn resort_should_reanchor_the_cursor_onto_its_photo() {
+        let mut grid = grid_shuffled();
+        grid.apply_order_change(); // FileName order: cursor on first tile
+        let cursor_photo = grid.id_at(grid.cursor.expect("armed")).expect("row");
+        grid.sort = SortKey::TakenAt;
+        stamp(&mut grid, 5, "2020-01-01 00:00:00"); // earliest overall
+
+        grid.apply_order_change();
+
+        let new_position = grid.cursor.expect("cursor survives a re-sort");
+        assert_eq!(
+            grid.id_at(new_position),
+            Some(cursor_photo),
+            "digits must keep hitting the same photo"
+        );
+    }
+
+    #[test]
+    fn resort_should_move_the_loupe_with_its_photo() {
+        let mut grid = grid_shuffled();
+        grid.sort = SortKey::TakenAt;
+        stamp(&mut grid, 2, "2019-01-01 00:00:00"); // id 2 sorts first
+        grid.apply_order_change();
+        grid.loupe = Some(loupe::LoupeView::at(0));
+
+        // Switching back to names moves id 2 away from slot 0…
+        grid.sort = SortKey::FileName;
+
+        grid.apply_order_change();
+
+        let loupe_position = grid.loupe.as_ref().expect("kept open").index();
+        assert_ne!(
+            loupe_position, 0,
+            "the loupe follows the photo it was showing"
+        );
+        assert_eq!(
+            grid.view[loupe_position], 3,
+            "…and lands on id 2's new slot (row 3)"
+        );
     }
 }

@@ -74,6 +74,14 @@ impl LoupeView {
     /// `index` addresses it, so navigation skips filtered-out photos.
     /// `auto_advance` is shared with the grid because Tab works in
     /// whichever view is on screen (SPEC §6).
+    ///
+    /// `suspended` freezes input while a modal dialog covers the screen
+    /// (help overlay, About): the photo keeps painting under the dimmed
+    /// backdrop, but keys, wheel zooming and panning stay quiet.
+    // The parameter list mirrors what a full-screen preview needs: state,
+    // shared sheet data, services and flags. Splitting it into structs
+    // would only move the count elsewhere.
+    #[expect(clippy::too_many_arguments)]
     pub fn ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -82,18 +90,23 @@ impl LoupeView {
         order: &[usize],
         textures: &mut Textures,
         auto_advance: &mut bool,
+        suspended: bool,
     ) -> Outcome {
         if order.is_empty() || self.index >= order.len() {
             return Outcome::Close;
         }
-        let (left, right, escape, enter) = ui.ctx().input(|input| {
-            (
-                input.key_pressed(egui::Key::ArrowLeft),
-                input.key_pressed(egui::Key::ArrowRight),
-                input.key_pressed(egui::Key::Escape),
-                input.key_pressed(egui::Key::Enter),
-            )
-        });
+        let (left, right, escape, enter) = if suspended {
+            (false, false, false, false)
+        } else {
+            ui.ctx().input(|input| {
+                (
+                    input.key_pressed(egui::Key::ArrowLeft),
+                    input.key_pressed(egui::Key::ArrowRight),
+                    input.key_pressed(egui::Key::Escape),
+                    input.key_pressed(egui::Key::Enter),
+                )
+            })
+        };
         if escape || enter {
             return Outcome::Close;
         }
@@ -106,11 +119,11 @@ impl LoupeView {
         }
         // Cull-pass keys: Tab flips the persisted advance mode, digits
         // label the photo on display and (when armed) walk forward.
-        if widgets::tab_pressed(ui.ctx()) {
+        if !suspended && widgets::tab_pressed(ui.ctx()) {
             *auto_advance = !*auto_advance;
             widgets::store_auto_advance(db, *auto_advance);
         }
-        if let Some(label) = widgets::pressed_label_key(ui.ctx()) {
+        if !suspended && let Some(label) = widgets::pressed_label_key(ui.ctx()) {
             self.apply_label(entries, order, db, label, *auto_advance);
         }
 
@@ -144,14 +157,15 @@ impl LoupeView {
         let fitted_size = super::grid::fit_rect(image_area, aspect).size();
         let max_zoom = max_zoom(entry, fitted_size);
 
-        if ui.ctx().input(|input| input.key_pressed(egui::Key::Space)) {
+        if !suspended && ui.ctx().input(|input| input.key_pressed(egui::Key::Space)) {
             let zoomed_in = self.zoom > FIT_ZOOM + f32::EPSILON * 8.0;
             self.zoom = if zoomed_in { FIT_ZOOM } else { max_zoom };
             self.pan = egui::Vec2::ZERO;
         }
 
         let scroll = ui.input(|input| input.smooth_scroll_delta.y);
-        if scroll != 0.0
+        if !suspended
+            && scroll != 0.0
             && response.hovered()
             && let Some(cursor) = response.hover_pos()
         {
@@ -170,7 +184,7 @@ impl LoupeView {
             self.zoom = zoom;
             self.pan = pan;
         }
-        if response.dragged() {
+        if !suspended && response.dragged() {
             self.pan = clamp_pan(
                 self.pan + response.drag_delta(),
                 fitted_size * self.zoom,

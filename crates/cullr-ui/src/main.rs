@@ -14,6 +14,13 @@ fn main() -> anyhow::Result<()> {
 
     let db = open_index_db()?;
 
+    // Window size/position persist across restarts via eframe's own
+    // `persistence` feature (enabled in Cargo.toml): it saves the rect on
+    // exit and restores it at startup, clamping degenerate sizes and
+    // off-screen positions against the connected monitors. The builder
+    // values below are only the first-launch defaults. No scale-factor is
+    // overridden anywhere — egui points track the platform DPI on X11 and
+    // Wayland untouched.
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Cullr")

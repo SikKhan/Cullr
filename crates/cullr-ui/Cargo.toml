@@ -9,7 +9,9 @@ authors.workspace = true
 
 [dependencies]
 cullr-core = { path = "../cullr-core" }
-eframe.workspace = true
+# "persistence" lets eframe save/restore the window rect across restarts
+# (with monitor clamping) and the egui memory; see main.rs.
+eframe = { workspace = true, features = ["persistence"] }
 image.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

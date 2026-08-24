@@ -104,8 +104,73 @@ pub enum FilterChip {
     Label(Label),
 }
 
+/// Sort order of the contact sheet (SPEC §6: filename / taken_at).
+///
+/// Pure data so the grid can sort its filtered view in-memory and keep
+/// loupe navigation, shift-click ranges and the cursor on one order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SortKey {
+    /// File name, case-insensitively.
+    #[default]
+    FileName,
+    /// EXIF capture time; photos without a stamp sort last.
+    TakenAt,
+}
+
+impl SortKey {
+    /// Flips between the two orders; the control is a single cycling
+    /// pill because two orders need no menu.
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::FileName => Self::TakenAt,
+            Self::TakenAt => Self::FileName,
+        }
+    }
+
+    /// Human name shown inside the sort pill.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FileName => "filename",
+            Self::TakenAt => "capture time",
+        }
+    }
+}
+
+/// Draws the sort pill (`Sort: filename`) and reports the order to apply,
+/// if the user clicked. Styled after [`filter_chips`] so both bars read
+/// as one control language.
+pub fn sort_pill(ui: &mut egui::Ui, current: SortKey) -> Option<SortKey> {
+    let text_font = egui::FontId::proportional(12.0);
+    let galley = ui.painter().layout_no_wrap(
+        format!("Sort: {}", current.label()),
+        text_font,
+        egui::Color32::WHITE,
+    );
+    let size = egui::vec2(CHIP_PADDING * 2.0 + galley.size().x, CHIP_HEIGHT);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let painter = ui.painter();
+    painter.rect_filled(rect, CHIP_HEIGHT / 2.0, theme::PANEL);
+    painter.rect_stroke(
+        rect,
+        CHIP_HEIGHT / 2.0,
+        egui::Stroke::new(1.0, theme::MUTED.gamma_multiply(0.45)),
+        egui::StrokeKind::Inside,
+    );
+    painter.galley(
+        egui::pos2(
+            rect.left() + CHIP_PADDING,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        theme::TEXT,
+    );
+    let clicked = response.clicked();
+    response.on_hover_text("Toggle sort order — arrows and Shift-click follow it");
+    clicked.then(|| current.cycle())
+}
+
 /// Pill height shared by every chip.
-const CHIP_HEIGHT: f32 = 22.0;
+pub(crate) const CHIP_HEIGHT: f32 = 22.0;
 /// Horizontal padding inside a chip.
 const CHIP_PADDING: f32 = 9.0;
 /// Gap between chips.
@@ -516,5 +581,23 @@ mod tests {
         assert_eq!(grouped(142), "142");
         assert_eq!(grouped(3210), "3\u{202f}210");
         assert_eq!(grouped(1_234_567), "1\u{202f}234\u{202f}567");
+    }
+
+    #[test]
+    fn sort_key_should_cycle_between_filename_and_capture_time() {
+        assert_eq!(SortKey::default(), SortKey::FileName);
+        assert_eq!(SortKey::FileName.cycle(), SortKey::TakenAt);
+
+        assert_eq!(
+            SortKey::TakenAt.cycle(),
+            SortKey::FileName,
+            "the cycle closes"
+        );
+    }
+
+    #[test]
+    fn sort_key_should_name_both_orders_for_the_pill() {
+        assert!(!SortKey::FileName.label().is_empty());
+        assert!(!SortKey::TakenAt.label().is_empty());
     }
 }

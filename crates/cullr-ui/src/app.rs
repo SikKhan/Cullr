@@ -21,6 +21,7 @@ use crate::tex::Textures;
 use crate::views::Action;
 use crate::views::grid::GridView;
 use crate::views::home::HomeView;
+use crate::views::modals::Modals;
 use crate::views::widgets;
 
 /// Repaint cadence while background work (scan, ingest, decode) is
@@ -63,6 +64,9 @@ pub struct App {
     ingest_generation: u64,
     /// Thumbnail decode + GPU upload service feeding grid cells.
     textures: Textures,
+    /// Help overlay + About dialog (SPEC §10 T14); drawn above whatever
+    /// screen is mounted, which stays suspended while either is open.
+    modals: Modals,
 }
 
 impl App {
@@ -94,6 +98,7 @@ impl App {
             ingest_rx,
             ingest_generation: 0,
             textures: Textures::new(),
+            modals: Modals::default(),
         }
     }
 
@@ -254,6 +259,7 @@ impl App {
                 }
                 self.screen = Screen::Home(HomeView);
             }
+            Some(Action::ShowAbout) => self.modals.open_about(),
         }
     }
 }
@@ -265,6 +271,11 @@ impl eframe::App for App {
         // paint them this same frame.
         self.textures.sync(&ctx);
         self.drain_events();
+        // Modal open/close intents are read before the views so a closing
+        // keypress never falls through into the screen underneath; while
+        // a modal is up the views render but stay input-suspended.
+        self.modals.pump_input(&ctx);
+        let suspended = self.modals.any();
 
         match &mut self.screen {
             Screen::Home(home) => {
@@ -277,11 +288,17 @@ impl eframe::App for App {
             Screen::Grid(grid) => {
                 let mut action = None;
                 egui::CentralPanel::default().show(ui, |ui| {
-                    action = grid.ui(ui, &self.db, &mut self.textures);
+                    action = grid.ui(ui, &self.db, &mut self.textures, suspended);
                 });
-                self.run_action(action);
+                if !suspended {
+                    self.run_action(action);
+                }
             }
         }
+
+        // Dialogs paint last so they sit above every layer the screens
+        // created this frame (SPEC §6 `?` overlay, About).
+        self.modals.draw(&ctx);
 
         self.pump_priority();
         self.schedule_repaint(&ctx);
