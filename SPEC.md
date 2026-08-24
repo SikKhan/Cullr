@@ -207,7 +207,7 @@ Export/copy kept+rejected sets, rename templates, XMP sidecars, recursive-scan U
 ## 12. License compliance checklist
 
 - [x] Cullr license expression: `GPL-3.0-or-later`
-- [ ] LICENSE file with GPLv3 text (T1)
-- [ ] Cargo.toml `license` field set (T1)
-- [ ] Third-party notice: rawler © dnglab contributors, LGPL-2.1 (README + About dialog, T14/T15)
+- [x] LICENSE file with GPLv3 text (T1)
+- [x] Cargo.toml `license` field set (T1)
+- [x] Third-party notice: rawler © dnglab contributors, LGPL-2.1 (README + About dialog, T14/T15)
 - [x] Source-available distribution satisfies LGPL-2.1 §6 relink requirement
