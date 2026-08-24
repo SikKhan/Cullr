@@ -18,5 +18,8 @@ crossbeam-channel.workspace = true
 dirs.workspace = true
 rfd.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true

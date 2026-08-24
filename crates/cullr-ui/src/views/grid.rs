@@ -40,6 +40,9 @@ const CELL_HEIGHT: f32 = IMAGE_HEIGHT + STRIP_HEIGHT;
 const NAME_MAX_CHARS: usize = 26;
 /// Spinner diameter inside cells.
 const SPINNER_SIZE: f32 = 22.0;
+/// Rows decoded ahead of the viewport above and below it (SPEC §5.3
+/// neighbor prefetch) so steady scrolling finds tiles already resident.
+const PREFETCH_ROWS: usize = 2;
 
 /// State of the Grid screen for the folder being browsed.
 pub struct GridView {
@@ -246,24 +249,32 @@ impl GridView {
 
     /// Virtualized tile sheet: only rows intersecting the viewport (plus a
     /// margin row, added by `show_rows`) allocate widgets or textures.
+    ///
+    /// The visible id set feeds the texture manager's focus (scroll-driven
+    /// decode cancellation) and a band of neighbouring rows is prefetched,
+    /// both after drawing so they see the settled viewport.
     fn draw_sheet(&mut self, ui: &mut egui::Ui, textures: &mut Textures) {
         ui.spacing_mut().item_spacing = egui::vec2(GAP, GAP);
         let columns = columns_for_width(ui.available_width()).max(1);
         let total_rows = self.entries.len().div_ceil(columns);
         let entries = &self.entries;
+        let mut visible_ids: Vec<PhotoId> = Vec::new();
         let mut visible_pending: Vec<PhotoId> = Vec::new();
+        let mut rows_shown = 0..0;
 
         egui::ScrollArea::vertical().auto_shrink(false).show_rows(
             ui,
             CELL_HEIGHT,
             total_rows,
             |ui, rows| {
+                rows_shown = rows.clone();
                 for row in rows {
                     ui.horizontal(|ui| {
                         for column in 0..columns {
                             let Some(entry) = entries.get(row * columns + column) else {
                                 break;
                             };
+                            visible_ids.push(entry.id);
                             draw_cell(ui, textures, entry, &mut visible_pending);
                         }
                     });
@@ -271,11 +282,42 @@ impl GridView {
             },
         );
 
+        // Row-major traversal is already sorted; `focus` relies on that.
+        visible_ids.sort_unstable();
+        textures.focus(&visible_ids);
+        self.prefetch_band(textures, rows_shown, columns, total_rows);
+
         visible_pending.sort_unstable();
         if visible_pending != self.last_ping && !visible_pending.is_empty() {
             self.last_ping = visible_pending.clone();
             self.ping = Some(visible_pending);
         }
+    }
+
+    /// Offers the rows just outside the viewport (± [`PREFETCH_ROWS`]) to
+    /// the texture cache as low-priority prefetches; only ingested tiles
+    /// with a cached thumb are offered, and the cache may decline them all
+    /// when its queues are saturated.
+    fn prefetch_band(
+        &self,
+        textures: &mut Textures,
+        rows: std::ops::Range<usize>,
+        columns: usize,
+        total_rows: usize,
+    ) {
+        if rows.is_empty() {
+            return;
+        }
+        let first = rows.start.saturating_sub(PREFETCH_ROWS);
+        let last = (rows.end + PREFETCH_ROWS).min(total_rows);
+        let entries = &self.entries;
+        let band = (first..last)
+            .filter(|row| !rows.contains(row))
+            .flat_map(|row| (0..columns).map(move |column| row * columns + column))
+            .filter_map(|cell| entries.get(cell))
+            .filter(|entry| entry.status == PhotoStatus::Ok)
+            .map(|entry| (entry.id, entry.thumb_path.as_deref()));
+        textures.prefetch(band);
     }
 }
 

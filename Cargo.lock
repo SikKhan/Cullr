@@ -923,6 +923,7 @@ dependencies = [
  "eframe",
  "image",
  "rfd",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]
