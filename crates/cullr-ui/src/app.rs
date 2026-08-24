@@ -1,5 +1,6 @@
 //! Cullr application shell: state machine root, event pump, theming, fonts.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,15 +13,18 @@ use cullr_core::Db;
 use cullr_core::IngestEvent;
 use cullr_core::IngestPipeline;
 use cullr_core::PhotoEntry;
+use cullr_core::PhotoId;
 use cullr_core::PhotoStatus;
 use cullr_core::ScanOptions;
 
+use crate::tex::Textures;
 use crate::views::Action;
 use crate::views::grid::GridView;
 use crate::views::home::HomeView;
 
-/// How often the UI wakes up to poll for background results while one runs.
-const BACKGROUND_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Repaint cadence while background work (scan, ingest, decode) is
+/// outstanding; short enough that spinners and progressive fills look live.
+const FRAME_PULSE: Duration = Duration::from_millis(33);
 
 /// Events produced by background jobs and drained by the App every frame.
 enum Event {
@@ -55,6 +59,8 @@ pub struct App {
     /// Generation of the batch currently mounted on the grid; events from
     /// any other generation belong to a superseded folder and are dropped.
     ingest_generation: u64,
+    /// Thumbnail decode + GPU upload service feeding grid cells.
+    textures: Textures,
 }
 
 impl App {
@@ -85,6 +91,7 @@ impl App {
             pipeline,
             ingest_rx,
             ingest_generation: 0,
+            textures: Textures::new(),
         }
     }
 
@@ -131,9 +138,8 @@ impl App {
         }
     }
 
-    /// Applies finished background jobs to the mounted screen and keeps the
-    /// frame loop alive while work is outstanding.
-    fn drain_events(&mut self, ctx: &egui::Context) {
+    /// Applies finished background jobs to the mounted screen.
+    fn drain_events(&mut self) {
         while let Ok(event) = self.events_rx.try_recv() {
             let Event::ScanFinished { root, result } = event;
             if self.scanning.as_ref() != Some(&root) {
@@ -142,6 +148,13 @@ impl App {
             self.scanning = None;
             match (&mut self.screen, result) {
                 (Screen::Grid(grid), outcome) => {
+                    // Purge texture state from any other folder before the
+                    // sheet mounts: cancelled batches stop occupying decode
+                    // and GPU budget, while this folder's warm cache stays.
+                    if let Ok(entries) = &outcome {
+                        let keep: HashSet<PhotoId> = entries.iter().map(|e| e.id).collect();
+                        self.textures.retain(&keep);
+                    }
                     grid.apply_scan(outcome);
                     self.start_ingest(&root);
                 }
@@ -159,30 +172,64 @@ impl App {
                 self.apply_ingest_event(event);
             }
         }
-        let busy = self.scanning.is_some()
-            || match &self.screen {
-                Screen::Grid(grid) => grid.is_ingesting(),
-                Screen::Home(_) => false,
-            };
-        if busy {
-            ctx.request_repaint_after(BACKGROUND_POLL_INTERVAL);
-        }
     }
 
     /// Routes one pipeline event into the grid; events from a superseded
-    /// batch (folder switched mid-run) are dropped by generation.
+    /// batch (folder switched mid-run) are dropped by generation. Each
+    /// result re-reads its index row so cells gain thumb path, pixel size
+    /// and error messages exactly when ingest produced them.
     fn apply_ingest_event(&mut self, event: IngestEvent) {
+        let (id, status) = match event {
+            IngestEvent::Ingested(id) => (id, PhotoStatus::Ok),
+            IngestEvent::Failed(id) => (id, PhotoStatus::Error),
+            IngestEvent::Finished { generation } => {
+                if generation == self.ingest_generation
+                    && let Screen::Grid(grid) = &mut self.screen
+                {
+                    grid.finish_ingest();
+                }
+                return;
+            }
+        };
+        let fresh = self.lookup_entry(id);
+        if let Screen::Grid(grid) = &mut self.screen {
+            grid.apply_ingest_result(id, status, fresh);
+        }
+    }
+
+    /// Best-effort row refresh for one ingest event; failures degrade to a
+    /// status-only cell update rather than dropping the event.
+    fn lookup_entry(&self, id: cullr_core::PhotoId) -> Option<PhotoEntry> {
+        match self.db.photo_entry(id) {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(%error, ?id, "cannot refresh ingested photo");
+                None
+            }
+        }
+    }
+
+    /// Forwards changed visible-pending sets to the ingest queue so tiles
+    /// near the viewport extract first (SPEC §5.2 priority ping).
+    fn pump_priority(&mut self) {
         let Screen::Grid(grid) = &mut self.screen else {
             return;
         };
-        match event {
-            IngestEvent::Ingested(id) => grid.apply_photo_result(id, PhotoStatus::Ok),
-            IngestEvent::Failed(id) => grid.apply_photo_result(id, PhotoStatus::Error),
-            IngestEvent::Finished { generation } => {
-                if generation == self.ingest_generation {
-                    grid.finish_ingest();
-                }
-            }
+        if let Some(ids) = grid.take_priority_ping()
+            && let Some(pipeline) = &self.pipeline
+        {
+            pipeline.prioritize(&ids);
+        }
+    }
+
+    /// Keeps the frame loop alive only while background work is outstanding;
+    /// idle screens cost zero wakeups.
+    fn schedule_repaint(&self, ctx: &egui::Context) {
+        let busy = self.scanning.is_some()
+            || matches!(&self.screen, Screen::Grid(grid) if grid.is_ingesting())
+            || self.textures.busy();
+        if busy {
+            ctx.request_repaint_after(FRAME_PULSE);
         }
     }
 
@@ -210,7 +257,11 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.drain_events(ui.ctx());
+        let ctx = ui.ctx().clone();
+        // Upload freshly decoded thumbnails before drawing so cells can
+        // paint them this same frame.
+        self.textures.sync(&ctx);
+        self.drain_events();
 
         match &mut self.screen {
             Screen::Home(home) => {
@@ -223,11 +274,14 @@ impl eframe::App for App {
             Screen::Grid(grid) => {
                 let mut action = None;
                 egui::CentralPanel::default().show(ui, |ui| {
-                    action = grid.ui(ui);
+                    action = grid.ui(ui, &mut self.textures);
                 });
                 self.run_action(action);
             }
         }
+
+        self.pump_priority();
+        self.schedule_repaint(&ctx);
     }
 }
 

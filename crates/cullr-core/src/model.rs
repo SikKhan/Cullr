@@ -140,8 +140,10 @@ impl PhotoStatus {
 
 /// A photo row as served by the index after a scan sync.
 ///
-/// This is the placeholder-level view the grid renders immediately;
-/// EXIF and texture paths arrive later via ingest events.
+/// This is everything a grid cell renders: identity, pipeline state, and —
+/// once ingest has touched the row — the thumbnail cache path plus preview
+/// pixel size for aspect-fit layout. Fields beyond [`PhotoEntry::status`]
+/// stay `None`/default until extraction fills them via ingest events.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PhotoEntry {
     /// Stable row handle used by all subsequent commands.
@@ -152,7 +154,45 @@ pub struct PhotoEntry {
     pub label: Label,
     /// Current pipeline state of the row.
     pub status: PhotoStatus,
+    /// Pixel size `(width, height)` of the extracted preview, before any
+    /// orientation rotation is applied; `None` until ingest succeeds.
+    pub pixels: Option<(u32, u32)>,
+    /// EXIF orientation flag (`1..8`) that must be applied on top of
+    /// [`PhotoEntry::pixels`] for display; defaults to upright (`1`).
+    pub orientation: u16,
+    /// Cache path of the downscaled thumbnail JPEG; `None` until ingest
+    /// succeeds or for rows whose extraction failed.
+    pub thumb_path: Option<PathBuf>,
+    /// Extraction failure description shown in error tiles (SPEC §7);
+    /// `None` unless status is [`PhotoStatus::Error`].
+    pub err_msg: Option<String>,
 }
+
+impl PhotoEntry {
+    /// Aspect ratio (width / height) to lay out this photo with: the stored
+    /// preview size rotated by the EXIF orientation flag. Falls back to the
+    /// common 3:2 landscape default while the row is still pending.
+    ///
+    /// Orientations 5..=8 are the 90° swaps, so they transpose the ratio;
+    /// mirrored variants keep the same silhouette as their base value.
+    pub fn display_aspect(&self) -> f32 {
+        let Some((width, height)) = self.pixels else {
+            return DEFAULT_ASPECT;
+        };
+        if width == 0 || height == 0 {
+            return DEFAULT_ASPECT;
+        }
+        let raw = width as f32 / height as f32;
+        if (5..=8).contains(&self.orientation) {
+            1.0 / raw
+        } else {
+            raw
+        }
+    }
+}
+
+/// Aspect ratio assumed for photos whose preview has not been measured yet.
+pub const DEFAULT_ASPECT: f32 = 3.0 / 2.0;
 
 /// A photo row awaiting ingest: its stable id plus the on-disk identity
 /// needed to extract it.
@@ -202,6 +242,39 @@ pub struct IngestInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_aspect_should_fall_back_to_three_halves_while_pending() {
+        let entry = PhotoEntry {
+            id: PhotoId(1),
+            rel_path: "a.nef".into(),
+            label: Label::None,
+            status: PhotoStatus::Pending,
+            pixels: None,
+            orientation: 1,
+            thumb_path: None,
+            err_msg: None,
+        };
+        assert!((entry.display_aspect() - 1.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn display_aspect_should_rotate_for_quarter_turn_orientations() {
+        let make = |orientation: u16| PhotoEntry {
+            id: PhotoId(1),
+            rel_path: "a.nef".into(),
+            label: Label::None,
+            status: PhotoStatus::Ok,
+            pixels: Some((6000, 4000)),
+            orientation,
+            thumb_path: None,
+            err_msg: None,
+        };
+        assert!((make(1).display_aspect() - 1.5).abs() < 0.01);
+        assert!((make(3).display_aspect() - 1.5).abs() < 0.01);
+        assert!((make(6).display_aspect() - 2.0 / 3.0).abs() < 0.01);
+        assert!((make(8).display_aspect() - 2.0 / 3.0).abs() < 0.01);
+    }
 
     #[test]
     fn label_to_u8_should_match_database_mapping() {

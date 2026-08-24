@@ -1,6 +1,7 @@
 //! Cullr — Photo Mechanic-style culling tool for RAW photographs.
 
 mod app;
+mod tex;
 mod theme;
 mod views;
 

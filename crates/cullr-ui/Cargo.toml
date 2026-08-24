@@ -10,6 +10,7 @@ authors.workspace = true
 [dependencies]
 cullr-core = { path = "../cullr-core" }
 eframe.workspace = true
+image.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

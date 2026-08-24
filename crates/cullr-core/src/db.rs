@@ -328,6 +328,30 @@ impl Db {
         })
     }
 
+    /// Fetches one photo row by id, refreshed with its latest ingest state.
+    ///
+    /// This is how the UI turns an [`crate::IngestEvent`] into up-to-date
+    /// cell content (thumbnail path, pixel size, error message); `None`
+    /// means the id does not exist (or was never part of this index).
+    pub fn photo_entry(&self, id: PhotoId) -> Result<Option<PhotoEntry>, DbError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT rel_path, label, status, width, height, orientation, thumb_path, err_msg
+                 FROM photos WHERE id = ?1",
+            )?;
+            let mut rows = stmt.query([narrow_u64(id.0)])?;
+            match rows.next()? {
+                Some(row) => Ok(Some(entry_from_row(
+                    id,
+                    PathBuf::from(row.get::<_, String>(0)?),
+                    row,
+                    1,
+                )?)),
+                None => Ok(None),
+            }
+        })
+    }
+
     /// Inserts or refreshes the `last_opened` stamp for a folder.
     ///
     /// The timestamp is caller-supplied (`now_millis()`) so ordering is
@@ -453,23 +477,51 @@ fn load_existing(
 fn load_entries(tx: &rusqlite::Transaction<'_>, root: &str) -> Result<Vec<PhotoEntry>, DbError> {
     // Missing rows stay out of navigation entirely (SPEC §7).
     let mut stmt = tx.prepare(
-        "SELECT id, rel_path, label, status FROM photos WHERE root = ?1 AND status <> 3",
+        "SELECT id, rel_path, label, status, width, height, orientation, thumb_path, err_msg
+         FROM photos WHERE root = ?1 AND status <> 3",
     )?;
     let rows = stmt.query_map([root], |row| {
-        Ok(PhotoEntry {
-            id: PhotoId(widen_to_u64(row.get::<_, i64>(0)?)),
-            rel_path: PathBuf::from(row.get::<_, String>(1)?),
-            label: Label::from_u8(u8::try_from(row.get::<_, i64>(2)?).unwrap_or(0))
-                .unwrap_or_default(),
-            status: PhotoStatus::from_u8(u8::try_from(row.get::<_, i64>(3)?).unwrap_or(0))
-                .unwrap_or_default(),
-        })
+        entry_from_row(
+            PhotoId(widen_to_u64(row.get::<_, i64>(0)?)),
+            PathBuf::from(row.get::<_, String>(1)?),
+            row,
+            2,
+        )
     })?;
     let mut entries: Vec<PhotoEntry> = rows.collect::<Result<Vec<_>, _>>()?;
     // Match scanner ordering (PathBuf Ord), which SQL BINARY collation does
     // not guarantee across platforms.
     entries.sort_unstable_by(|a, b| a.rel_path.cmp(&b.rel_path));
     Ok(entries)
+}
+
+/// Assembles a [`PhotoEntry`] from the cell-facing columns of a `photos`
+/// row. `rel_path` comes from the caller because the two query shapes
+/// select it at different positions; `base` is the column index of `label`
+/// followed by `status, width, height, orientation, thumb_path, err_msg`.
+fn entry_from_row(
+    id: PhotoId,
+    rel_path: PathBuf,
+    row: &rusqlite::Row<'_>,
+    base: usize,
+) -> Result<PhotoEntry, rusqlite::Error> {
+    let label: i64 = row.get(base)?;
+    let status: i64 = row.get(base + 1)?;
+    let width: Option<i64> = row.get(base + 2)?;
+    let height: Option<i64> = row.get(base + 3)?;
+    let pixels = width
+        .and_then(|w| u32::try_from(widen_to_u64(w)).ok())
+        .zip(height.and_then(|h| u32::try_from(widen_to_u64(h)).ok()));
+    Ok(PhotoEntry {
+        id,
+        rel_path,
+        label: Label::from_u8(u8::try_from(label).unwrap_or(0)).unwrap_or_default(),
+        status: PhotoStatus::from_u8(u8::try_from(status).unwrap_or(0)).unwrap_or_default(),
+        pixels,
+        orientation: u16::try_from(row.get::<_, i64>(base + 4)?).unwrap_or(1),
+        thumb_path: row.get::<_, Option<String>>(base + 5)?.map(PathBuf::from),
+        err_msg: row.get(base + 6)?,
+    })
 }
 
 fn is_nested(rel_path: &Path) -> bool {
@@ -569,6 +621,21 @@ mod tests {
         .expect("text query")
     }
 
+    /// Freshly scanned rows carry only identity + pending state; every
+    /// ingest-filled column is empty.
+    fn pending_entry() -> PhotoEntry {
+        PhotoEntry {
+            id: PhotoId(0),
+            rel_path: PathBuf::new(),
+            label: Label::None,
+            status: PhotoStatus::Pending,
+            pixels: None,
+            orientation: 1,
+            thumb_path: None,
+            err_msg: None,
+        }
+    }
+
     #[test]
     fn open_should_apply_latest_schema_version_on_fresh_database() {
         let fx = open_db();
@@ -646,14 +713,12 @@ mod tests {
                 PhotoEntry {
                     id: entries[0].id,
                     rel_path: "a.nef".into(),
-                    label: Label::None,
-                    status: PhotoStatus::Pending,
+                    ..pending_entry()
                 },
                 PhotoEntry {
                     id: entries[1].id,
                     rel_path: "b.arw".into(),
-                    label: Label::None,
-                    status: PhotoStatus::Pending,
+                    ..pending_entry()
                 },
             ]
         );
@@ -1017,6 +1082,95 @@ mod tests {
                 )
             ),
             1
+        );
+    }
+
+    #[test]
+    fn photo_entry_should_surface_ingested_cell_state() {
+        let fx = open_db();
+        let root = fx._dir.path();
+        let scanned = vec![meta(root, "a.nef", 1, 10)];
+        let entries = fx
+            .db
+            .sync_scan(root, &scanned, ScanOptions::default())
+            .expect("sync");
+        fx.db
+            .record_ingest_ok(
+                entries[0].id,
+                &IngestInfo {
+                    width: 6000,
+                    height: 4000,
+                    orientation: 6,
+                    camera: None,
+                    lens: None,
+                    taken_at: None,
+                    shutter: None,
+                    aperture: None,
+                    iso: None,
+                    focal_mm: None,
+                    preview_path: "/cache/previews/x.jpg".into(),
+                    thumb_path: "/cache/thumbs/x.jpg".into(),
+                },
+            )
+            .expect("ingest ok");
+
+        let entry = fx.db.photo_entry(entries[0].id).expect("photo_entry");
+
+        assert_eq!(entry.as_ref().map(|e| e.id), Some(entries[0].id));
+        let entry = entry.expect("row exists");
+        assert_eq!(entry.status, PhotoStatus::Ok);
+        assert_eq!(entry.pixels, Some((6000, 4000)));
+        assert_eq!(entry.orientation, 6);
+        assert_eq!(entry.thumb_path, Some("/cache/thumbs/x.jpg".into()));
+    }
+
+    #[test]
+    fn photo_entry_should_carry_error_messages_for_failed_rows() {
+        let fx = open_db();
+        let root = fx._dir.path();
+        let scanned = vec![meta(root, "a.nef", 1, 10)];
+        let entries = fx
+            .db
+            .sync_scan(root, &scanned, ScanOptions::default())
+            .expect("sync");
+        fx.db
+            .record_ingest_error(entries[0].id, "corrupt header")
+            .expect("ingest error");
+
+        let entry = fx.db.photo_entry(entries[0].id).expect("photo_entry");
+
+        let entry = entry.expect("row exists");
+        assert_eq!(entry.status, PhotoStatus::Error);
+        assert_eq!(entry.err_msg.as_deref(), Some("corrupt header"));
+        assert_eq!(entry.thumb_path, None);
+    }
+
+    #[test]
+    fn photo_entry_should_return_none_for_unknown_ids() {
+        let fx = open_db();
+
+        let entry = fx.db.photo_entry(PhotoId(9_999)).expect("photo_entry");
+
+        assert_eq!(entry, None);
+    }
+
+    #[test]
+    fn pending_entries_should_default_orientation_and_leave_assets_empty() {
+        let fx = open_db();
+        let root = fx._dir.path();
+        let scanned = vec![meta(root, "a.nef", 1, 10)];
+        let entries = fx
+            .db
+            .sync_scan(root, &scanned, ScanOptions::default())
+            .expect("sync");
+
+        assert_eq!(
+            entries,
+            vec![PhotoEntry {
+                id: entries[0].id,
+                rel_path: "a.nef".into(),
+                ..pending_entry()
+            }]
         );
     }
 

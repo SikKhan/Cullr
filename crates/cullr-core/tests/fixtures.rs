@@ -10,7 +10,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use cullr_core::{Cache, IngestEvent, IngestPipeline, PhotoMeta, extract_file};
 use tempfile::TempDir;
@@ -227,6 +227,52 @@ fn fixture_folder_should_ingest_to_an_ok_row_streaming_events() {
     assert!(
         rows.is_empty(),
         "the single photo must have left the pending queue"
+    );
+}
+
+/// SPEC §8 first-thumb budget, cold: from folder open (scan start) to the
+/// first `Ingested` event must stay under 1.5 s on real media. Runs against
+/// the whole fixture folder when it holds several files; the first event is
+/// what the grid paints, the rest stream in behind it.
+#[test]
+fn fixture_first_thumb_should_land_within_the_cold_budget() {
+    let Some(root) = std::env::var_os("CULLR_FIXTURES").map(PathBuf::from) else {
+        return;
+    };
+    if !root.is_dir() {
+        return;
+    }
+    let scratch = TempDir::new().expect("scratch dir");
+    let db = Arc::new(cullr_core::Db::open(&scratch.path().join("index.db")).expect("db"));
+
+    let started = Instant::now();
+    let scanned = cullr_core::scan_folder(&root, cullr_core::ScanOptions::default()).expect("scan");
+    assert!(
+        !scanned.is_empty(),
+        "fixture folder holds no supported files"
+    );
+    db.sync_scan(&root, &scanned, cullr_core::ScanOptions::default())
+        .expect("sync");
+    let (pipeline, events) =
+        IngestPipeline::new(Cache::new(scratch.path().join("cache")), Arc::clone(&db));
+    pipeline.enqueue(db.pending_photos(&root).expect("pending"));
+
+    loop {
+        match events
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("ingest events")
+        {
+            IngestEvent::Ingested(_) => break,
+            IngestEvent::Failed(_) => continue, // keep waiting for a good one
+            IngestEvent::Finished { .. } => panic!("batch finished before any thumb arrived"),
+        }
+    }
+    let elapsed = started.elapsed();
+
+    println!("first thumb cold in {elapsed:?}");
+    assert!(
+        elapsed.as_secs_f64() < 1.5,
+        "first-thumb budget blown: {elapsed:?} ≥ 1.5 s"
     );
 }
 
