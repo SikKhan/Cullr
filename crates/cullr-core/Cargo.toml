@@ -16,6 +16,8 @@ rawler.workspace = true
 image.workspace = true
 md-5.workspace = true
 dirs.workspace = true
+rayon.workspace = true
+crossbeam-channel.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

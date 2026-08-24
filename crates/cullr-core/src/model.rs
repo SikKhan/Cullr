@@ -154,6 +154,19 @@ pub struct PhotoEntry {
     pub status: PhotoStatus,
 }
 
+/// A photo row awaiting ingest: its stable id plus the on-disk identity
+/// needed to extract it.
+///
+/// Produced by [`crate::db`] when a folder opens; consumed by the ingest
+/// pipeline, which turns each one into an `Ok`/`Error` row plus an event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingPhoto {
+    /// Index row handle.
+    pub id: PhotoId,
+    /// File identity used for extraction and cache keying.
+    pub meta: PhotoMeta,
+}
+
 /// Metadata and cache paths captured during a successful ingest.
 ///
 /// Produced by the extraction module, written to the index by [`crate::db`];

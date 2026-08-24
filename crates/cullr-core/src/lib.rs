@@ -25,13 +25,15 @@ pub mod cache;
 pub mod db;
 pub mod exif;
 pub mod extract;
+pub mod ingest;
 pub mod model;
 pub mod scanner;
 
 pub use cache::{Cache, CacheError};
 pub use db::{Db, DbError, now_millis};
 pub use extract::{ExtractError, extract_file, is_supported_extension};
-pub use model::{IngestInfo, Label, PhotoEntry, PhotoId, PhotoMeta, PhotoStatus};
+pub use ingest::{IngestEvent, IngestPipeline};
+pub use model::{IngestInfo, Label, PendingPhoto, PhotoEntry, PhotoId, PhotoMeta, PhotoStatus};
 pub use scanner::{ScanError, ScanOptions, scan_folder};
 
 /// Semantic version of the engine, mirroring the crate version.

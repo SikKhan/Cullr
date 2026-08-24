@@ -38,7 +38,7 @@ use std::time::{Duration, SystemTime};
 use rusqlite::{Connection, params};
 use thiserror::Error;
 
-use crate::model::{IngestInfo, Label, PhotoEntry, PhotoId, PhotoMeta, PhotoStatus};
+use crate::model::{IngestInfo, Label, PendingPhoto, PhotoEntry, PhotoId, PhotoMeta, PhotoStatus};
 use crate::scanner::ScanOptions;
 
 /// Schema revision this build understands; bumped with every migration.
@@ -151,7 +151,9 @@ impl Db {
     /// Poisoned locks are adopted rather than propagated: transactions keep
     /// SQLite consistent even if a worker panicked mid-write, and refusing
     /// all future access would permanently brick the app over one panic.
-    fn with_conn<T>(
+    /// Statement ownership stays with the repository methods; this is
+    /// `pub(crate)` so sibling-module tests can inspect raw state.
+    pub(crate) fn with_conn<T>(
         &self,
         body: impl FnOnce(&mut Connection) -> Result<T, DbError>,
     ) -> Result<T, DbError> {
@@ -231,6 +233,34 @@ impl Db {
             let entries = load_entries(&tx, &root_text)?;
             tx.commit()?;
             Ok(entries)
+        })
+    }
+
+    /// Every row under `root` still awaiting ingest, ordered by path.
+    ///
+    /// This is the queue the ingest pipeline drains after a scan: new files
+    /// and rows reset by [`Db::sync_scan`] come back as pending, while
+    /// already-ingested and previously-errored rows are left alone so a
+    /// poison file is never retried on every folder open.
+    pub fn pending_photos(&self, root: &Path) -> Result<Vec<PendingPhoto>, DbError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT id, rel_path, mtime, size FROM photos
+                 WHERE root = ?1 AND status = 0 ORDER BY rel_path",
+            )?;
+            let root_text = root.to_string_lossy().into_owned();
+            let rows = stmt.query_map([root_text], |row| {
+                Ok(PendingPhoto {
+                    id: PhotoId(widen_to_u64(row.get::<_, i64>(0)?)),
+                    meta: PhotoMeta {
+                        root: root.to_owned(),
+                        rel_path: PathBuf::from(row.get::<_, String>(1)?),
+                        mtime: i64_to_system_time(row.get::<_, i64>(2)?),
+                        size: widen_to_u64(row.get::<_, i64>(3)?),
+                    },
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
         })
     }
 
@@ -461,6 +491,16 @@ fn system_time_to_i64(time: SystemTime) -> i64 {
     match time.duration_since(SystemTime::UNIX_EPOCH) {
         Ok(delta) => nanos_to_i64(delta.as_nanos()),
         Err(err) => -nanos_to_i64(err.duration().as_nanos()),
+    }
+}
+
+/// Inverse of [`system_time_to_i64`]; reconstructs the exact stat instant
+/// stored during a scan.
+fn i64_to_system_time(value: i64) -> SystemTime {
+    if value >= 0 {
+        SystemTime::UNIX_EPOCH + Duration::from_nanos(u64::try_from(value).unwrap_or(0))
+    } else {
+        SystemTime::UNIX_EPOCH - Duration::from_nanos(value.unsigned_abs())
     }
 }
 
@@ -824,6 +864,85 @@ mod tests {
             .expect("resync");
 
         assert_eq!(second[0].label, Label::Green);
+    }
+
+    #[test]
+    fn pending_photos_should_return_only_unprocessed_rows_with_file_identity() {
+        let fx = open_db();
+        let root = fx._dir.path();
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let scanned = vec![
+            PhotoMeta {
+                root: root.to_owned(),
+                rel_path: "a.nef".into(),
+                mtime,
+                size: 123,
+            },
+            PhotoMeta {
+                root: root.to_owned(),
+                rel_path: "b.arw".into(),
+                mtime,
+                size: 456,
+            },
+        ];
+        let entries = fx
+            .db
+            .sync_scan(root, &scanned, ScanOptions::default())
+            .expect("sync");
+        fx.db
+            .record_ingest_ok(
+                entries[0].id,
+                &IngestInfo {
+                    width: 1,
+                    height: 1,
+                    orientation: 1,
+                    camera: None,
+                    lens: None,
+                    taken_at: None,
+                    shutter: None,
+                    aperture: None,
+                    iso: None,
+                    focal_mm: None,
+                    preview_path: "p.jpg".into(),
+                    thumb_path: "t.jpg".into(),
+                },
+            )
+            .expect("ingest ok");
+
+        let pending = fx.db.pending_photos(root).expect("pending");
+
+        assert_eq!(
+            pending,
+            vec![PendingPhoto {
+                id: entries[1].id,
+                meta: PhotoMeta {
+                    root: root.to_owned(),
+                    rel_path: "b.arw".into(),
+                    mtime,
+                    size: 456,
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn pending_photos_should_round_trip_pre_epoch_mtimes_losslessly() {
+        let fx = open_db();
+        let root = fx._dir.path();
+        let pre_epoch = SystemTime::UNIX_EPOCH - Duration::from_secs(5);
+        let scanned = vec![PhotoMeta {
+            root: root.to_owned(),
+            rel_path: "old.orf".into(),
+            mtime: pre_epoch,
+            size: 7,
+        }];
+        fx.db
+            .sync_scan(root, &scanned, ScanOptions::default())
+            .expect("sync");
+
+        let pending = fx.db.pending_photos(root).expect("pending");
+
+        assert_eq!(pending[0].meta.mtime, pre_epoch);
     }
 
     #[test]

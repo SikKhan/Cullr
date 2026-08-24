@@ -350,6 +350,10 @@ fn payload_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload_message(payload)
+}
+
 #[cfg(test)]
 mod tests {
     #![expect(clippy::expect_used)]

@@ -899,10 +899,12 @@ dependencies = [
 name = "cullr-core"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-channel",
  "dirs",
  "image",
  "md-5",
  "rawler",
+ "rayon",
  "rusqlite",
  "tempfile",
  "thiserror 2.0.20",

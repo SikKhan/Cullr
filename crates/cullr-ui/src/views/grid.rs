@@ -1,14 +1,17 @@
 //! Grid view: contact sheet of placeholder tiles for one folder.
 //!
 //! Real virtualization, aspect-fit cells and textures arrive in T7/T8; this
-//! module already owns the screen chrome (top bar with folder + count) and
-//! the Home ⇄ Grid navigation contract.
+//! module already owns the screen chrome (top bar with folder + count), the
+//! Home ⇄ Grid navigation contract and live ingest progress from T6.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use eframe::egui;
 
 use cullr_core::PhotoEntry;
+use cullr_core::PhotoId;
+use cullr_core::PhotoStatus;
 
 use super::Action;
 use crate::theme;
@@ -24,8 +27,12 @@ const NAME_MAX_CHARS: usize = 26;
 pub struct GridView {
     root: PathBuf,
     entries: Vec<PhotoEntry>,
+    /// Row index by photo id so per-photo ingest events are O(1) updates.
+    index: HashMap<PhotoId, usize>,
     loading: bool,
     error: Option<String>,
+    ingest_total: usize,
+    ingest_done: usize,
 }
 
 impl GridView {
@@ -35,8 +42,11 @@ impl GridView {
         Self {
             root,
             entries: Vec::new(),
+            index: HashMap::new(),
             loading: true,
             error: None,
+            ingest_total: 0,
+            ingest_done: 0,
         }
     }
 
@@ -44,9 +54,43 @@ impl GridView {
     pub fn apply_scan(&mut self, result: Result<Vec<PhotoEntry>, String>) {
         self.loading = false;
         match result {
-            Ok(entries) => self.entries = entries,
+            Ok(entries) => {
+                self.index = entries
+                    .iter()
+                    .enumerate()
+                    .map(|(index, entry)| (entry.id, index))
+                    .collect();
+                self.entries = entries;
+            }
             Err(message) => self.error = Some(message),
         }
+    }
+
+    /// Announces a running ingest batch of `total` photos.
+    pub fn begin_ingest(&mut self, total: usize) {
+        self.ingest_total = total;
+        self.ingest_done = 0;
+    }
+
+    /// Applies one finished extraction; events for photos that are not on
+    /// this grid (stale generation) fall through as no-ops.
+    pub fn apply_photo_result(&mut self, id: PhotoId, status: PhotoStatus) {
+        if self.ingest_done < self.ingest_total {
+            self.ingest_done += 1;
+        }
+        if let Some(&index) = self.index.get(&id) {
+            self.entries[index].status = status;
+        }
+    }
+
+    /// Marks the active batch complete so progress UI retires.
+    pub fn finish_ingest(&mut self) {
+        self.ingest_done = self.ingest_total;
+    }
+
+    /// `true` while a batch is still producing tiles.
+    pub fn is_ingesting(&self) -> bool {
+        self.ingest_done < self.ingest_total
     }
 
     /// Draws the screen and reports the user's action, if any.
@@ -81,6 +125,14 @@ impl GridView {
 
             let count = if self.loading {
                 "Scanning…".to_owned()
+            } else if self.is_ingesting() {
+                format!(
+                    "{} photo{} · extracting {} / {}",
+                    self.entries.len(),
+                    if self.entries.len() == 1 { "" } else { "s" },
+                    self.ingest_done,
+                    self.ingest_total
+                )
             } else {
                 format!(
                     "{} photo{}",
@@ -154,8 +206,8 @@ impl GridView {
     }
 }
 
-/// One placeholder tile: panel-colored rectangle with a filename strip and
-/// the full relative path as tooltip.
+/// One placeholder tile: panel-colored rectangle with a filename strip that
+/// reflects pipeline state (dim while pending, ⚠ when extraction failed).
 fn draw_cell(ui: &mut egui::Ui, entry: &PhotoEntry) {
     let (rect, response) = ui.allocate_exact_size(CELL_SIZE, egui::Sense::hover());
     let painter = ui.painter();
@@ -167,15 +219,30 @@ fn draw_cell(ui: &mut egui::Ui, entry: &PhotoEntry) {
         rect.right_bottom(),
     );
     painter.rect_filled(strip, 6.0, theme::BG);
+    let name = truncated(file_name(entry));
+    let name = if entry.status == PhotoStatus::Error {
+        format!("⚠ {name}")
+    } else {
+        name
+    };
+    let color = if entry.status == PhotoStatus::Ok {
+        theme::TEXT
+    } else {
+        theme::MUTED
+    };
     painter.text(
         strip.center(),
         egui::Align2::CENTER_CENTER,
-        truncated(file_name(entry)),
+        name,
         egui::FontId::proportional(11.0),
-        theme::MUTED,
+        color,
     );
 
-    response.on_hover_text(entry.rel_path.display().to_string());
+    let tooltip = match entry.status {
+        PhotoStatus::Error => format!("{} (extraction failed)", entry.rel_path.display()),
+        _ => entry.rel_path.display().to_string(),
+    };
+    response.on_hover_text(tooltip);
 }
 
 fn file_name(entry: &PhotoEntry) -> std::borrow::Cow<'_, str> {

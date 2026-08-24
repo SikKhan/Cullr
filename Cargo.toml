@@ -24,6 +24,7 @@ tempfile = "3"
 crossbeam-channel = "0.5"
 dirs = "6"
 rfd = "0.15"
+rayon = "1.10"
 
 [workspace.lints.rust]
 missing_docs = "deny"
