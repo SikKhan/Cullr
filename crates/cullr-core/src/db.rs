@@ -283,6 +283,24 @@ impl Db {
         })
     }
 
+    /// Persists one color label onto many photos in a single transaction
+    /// (SPEC §10 T12 batch labeling): one commit however large the batch,
+    /// so a hundred-photo relabel costs one fsync, not a hundred.
+    /// Unknown ids are skipped like in [`Self::set_label`].
+    pub fn set_labels(&self, ids: &[PhotoId], label: Label) -> Result<(), DbError> {
+        self.with_conn(|conn| {
+            let tx = conn.transaction()?;
+            {
+                let mut update = tx.prepare_cached("UPDATE photos SET label = ?2 WHERE id = ?1")?;
+                for &id in ids {
+                    update.execute(params![narrow_u64(id.0), label.to_u8()])?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     /// Records a successful ingest, attaching metadata and cache paths.
     pub fn record_ingest_ok(&self, id: PhotoId, info: &IngestInfo) -> Result<(), DbError> {
         self.with_conn(|conn| {
@@ -1324,6 +1342,55 @@ mod tests {
                 )
             ),
             1
+        );
+    }
+
+    #[test]
+    fn set_labels_should_relabel_every_listed_row_in_one_commit() {
+        let fx = open_db();
+        let root = fx._dir.path();
+        let scanned = vec![meta(root, "a.nef", 1, 10), meta(root, "b.arw", 2, 20)];
+        let entries = fx
+            .db
+            .sync_scan(root, &scanned, ScanOptions::default())
+            .expect("sync");
+        let ids: Vec<PhotoId> = entries.iter().map(|entry| entry.id).collect();
+
+        fx.db.set_labels(&ids, Label::Green).expect("labels");
+
+        for id in ids {
+            assert_eq!(
+                scalar(
+                    &fx.db,
+                    &format!("SELECT label FROM photos WHERE id = {}", id.0)
+                ),
+                Label::Green.to_u8() as i64
+            );
+        }
+    }
+
+    #[test]
+    fn set_labels_should_skip_unknown_ids_without_failing() {
+        let fx = open_db();
+        let root = fx._dir.path();
+        let scanned = vec![meta(root, "a.nef", 1, 10)];
+        let entries = fx
+            .db
+            .sync_scan(root, &scanned, ScanOptions::default())
+            .expect("sync");
+
+        // One live row plus a stale one from a vanished photo; the batch
+        // must land on the former and shrug off the latter.
+        fx.db
+            .set_labels(&[entries[0].id, PhotoId(999_999)], Label::Blue)
+            .expect("labels");
+
+        assert_eq!(
+            scalar(
+                &fx.db,
+                &format!("SELECT label FROM photos WHERE id = {}", entries[0].id.0)
+            ),
+            Label::Blue.to_u8() as i64
         );
     }
 

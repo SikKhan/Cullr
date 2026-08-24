@@ -13,11 +13,19 @@
 //! pass over the rows — microseconds at 10k — and re-anchor the cursor
 //! onto its photo when it survives (SPEC §10 T11).
 //!
+//! Selection is a set of photo ids layered over that cursor (SPEC §6):
+//! click focuses + selects, Ctrl-click toggles, Shift-click ranges from
+//! an anchor, dragging a rubber band selects what it covers, and digits
+//! label the whole set in one keystroke. Because membership is keyed by
+//! id, refilters and reorders never silently drop marked photos; the
+//! marquee maps screen points back to tiles through pure cell geometry.
+//!
 //! The sheet also feeds the ingest engine's visible-window priority: every
 //! frame's visible-but-pending ids are reported via [`Self::take_priority_ping`]
 //! whenever the set changes (SPEC §5.2).
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -63,6 +71,10 @@ const NAV_KEYS: [egui::Key; 4] = [
     egui::Key::ArrowUp,
     egui::Key::ArrowDown,
 ];
+/// Pointer travel before a press becomes a rubber-band drag; below it a
+/// press-and-release stays a click (SPEC §6 selection). Matches egui's
+/// own click slop so the two never disagree.
+const MARQUEE_MIN_DRAG: f32 = 6.0;
 
 /// State of the Grid screen for the folder being browsed.
 pub struct GridView {
@@ -90,6 +102,14 @@ pub struct GridView {
     /// digits label its photo, Enter/Space open the loupe on it. Starts
     /// on the first tile so keys work the moment a folder is open.
     cursor: Option<usize>,
+    /// Selected photos (SPEC §6), keyed by id so refilters keep member-
+    /// ship while tiles hide or reorder. Digits label the whole set.
+    selection: HashSet<PhotoId>,
+    /// View position where the last plain or Ctrl click landed; Shift-
+    /// click ranges from here through the clicked tile.
+    anchor: Option<usize>,
+    /// Rubber-band drag over the sheet, while one is in progress.
+    marquee: Option<Marquee>,
     /// Cursor row queued for a one-shot scroll-into-view.
     scroll_target: Option<usize>,
     /// Auto-advance-after-label, persisted across sessions (SPEC §6).
@@ -123,6 +143,9 @@ impl GridView {
             last_ping: Vec::new(),
             ping: None,
             cursor: None,
+            selection: HashSet::new(),
+            anchor: None,
+            marquee: None,
             scroll_target: None,
             auto_advance,
             open_requested: None,
@@ -141,6 +164,11 @@ impl GridView {
                     .map(|(index, entry)| (entry.id, index))
                     .collect();
                 self.entries = entries;
+                // Ids from the replaced row set must not leak into the
+                // fresh folder's batches or counts.
+                self.selection.clear();
+                self.anchor = None;
+                self.marquee = None;
                 self.rebuild_view();
                 // Keys must work before any click, so the cursor arms on
                 // the first tile as soon as the folder resolves.
@@ -236,6 +264,18 @@ impl GridView {
         } else {
             (false, false, None)
         };
+        // Select all / none sweep only what survives the filter: photos
+        // hidden by a chip never join a batch (SPEC §6 keyboard map).
+        let (select_all, select_none) = if sheet_keys {
+            ui.ctx().input(|input| {
+                (
+                    input.key_pressed(egui::Key::A) && input.modifiers.command_only(),
+                    input.key_pressed(egui::Key::A) && input.modifiers.shift_only(),
+                )
+            })
+        } else {
+            (false, false)
+        };
         // The filter preset key works everywhere in the folder, loupe
         // included, so "show me only what I marked" is one press away.
         if !self.loading && ui.ctx().input(|input| input.key_pressed(egui::Key::F)) {
@@ -253,10 +293,16 @@ impl GridView {
                 self.auto_advance = !self.auto_advance;
                 widgets::store_auto_advance(db, self.auto_advance);
             }
-            if let Some(label) = widgets::pressed_label_key(ui.ctx())
-                && let Some(cursor) = self.cursor
-            {
-                self.label_cursor(db, cursor, label);
+            if select_all {
+                self.select_all();
+            }
+            if select_none {
+                // The cursor stays put so arrows and digits keep working
+                // from the same tile (SPEC §6: cursor + selection set).
+                self.selection.clear();
+            }
+            if let Some(label) = widgets::pressed_label_key(ui.ctx()) {
+                self.apply_label(db, label);
             }
             if let Some(cursor) = self.cursor
                 && let Some(next) =
@@ -351,6 +397,13 @@ impl GridView {
             line.push_str(&format!(
                 " · extracting {} / {} · {}/s",
                 self.ingest_done, self.ingest_total, rate as u64
+            ));
+        }
+        if !self.selection.is_empty() {
+            // Batch feedback next to the counts it acts on (SPEC §10 T12).
+            line.push_str(&format!(
+                " · {} selected",
+                widgets::grouped(self.selection.len())
             ));
         }
         line
@@ -600,6 +653,158 @@ impl GridView {
         }
     }
 
+    /// Selects every photo surviving the filter (SPEC §6 Ctrl+A): a
+    /// batch must never sweep tiles the user culled out of sight.
+    fn select_all(&mut self) {
+        self.selection = self
+            .view
+            .iter()
+            .filter_map(|&row| self.entries.get(row))
+            .map(|entry| entry.id)
+            .collect();
+    }
+
+    /// Photo id at a filtered-order position, if any.
+    fn id_at(&self, position: usize) -> Option<PhotoId> {
+        let &row = self.view.get(position)?;
+        self.entries.get(row).map(|entry| entry.id)
+    }
+
+    /// Applies a digit label to every selected photo — or to the
+    /// cursor's photo when nothing is selected (SPEC §6: digits apply to
+    /// the selection). Rows mirror instantly so tiles recolor this
+    /// frame; persistence lands as one transaction however big the
+    /// batch. Auto-advance stays out of multi-photo relabels: a hundred-
+    /// photo keystroke must not fling the cursor down the sheet.
+    fn apply_label(&mut self, db: &cullr_core::Db, label: cullr_core::Label) {
+        if self.selection.is_empty() {
+            if let Some(cursor) = self.cursor {
+                self.label_cursor(db, cursor, label);
+            }
+            return;
+        }
+        let mut changed: Vec<PhotoId> = Vec::new();
+        for entry in &mut self.entries {
+            if self.selection.contains(&entry.id) && entry.label != label {
+                entry.label = label;
+                changed.push(entry.id);
+            }
+        }
+        if !changed.is_empty()
+            && let Err(error) = db.set_labels(&changed, label)
+        {
+            tracing::warn!(%error, photos = changed.len(), "cannot persist labels");
+        }
+    }
+
+    /// Advances the rubber-band state machine one frame (SPEC §6 drag
+    /// marquee). A press inside the sheet viewport arms a candidate;
+    /// travel past [`MARQUEE_MIN_DRAG`] makes it live and every frame it
+    /// selects the tiles its band covers — replacing the set, or union-
+    /// ing onto the press-time set under Ctrl. Release returns `true`
+    /// when a real drag just finished so tile click handlers stay quiet;
+    /// press-and-release without travel on bare sheet clears the set,
+    /// like any file manager's empty-space click.
+    ///
+    /// `origin` is the screen point of view slot 0 (from [`tile_origin`]);
+    /// without drawn tiles there is no geometry and nothing to do.
+    fn step_marquee(
+        &mut self,
+        ui: &egui::Ui,
+        origin: Option<egui::Pos2>,
+        columns: usize,
+        viewport: egui::Rect,
+    ) -> bool {
+        let Some(origin) = origin else {
+            return false;
+        };
+        let (pressed, released, pointer, modifiers) = ui.ctx().input(|input| {
+            (
+                input.pointer.primary_pressed(),
+                input.pointer.primary_released(),
+                input.pointer.latest_pos(),
+                input.modifiers,
+            )
+        });
+        if pressed {
+            if let Some(start) = pointer.filter(|start| viewport.contains(*start)) {
+                // The live set parks in `base`: ctrl-drag unions onto it,
+                // an aborted drag hands it back untouched.
+                self.marquee = Some(Marquee {
+                    start,
+                    base: std::mem::take(&mut self.selection),
+                    additive: modifiers.command,
+                    dragging: false,
+                });
+            }
+            return false;
+        }
+        // Owned for the rest of the frame so tile lookups can run while
+        // the state is out of `self`; stored back before returning.
+        let Some(mut marquee) = self.marquee.take() else {
+            return false;
+        };
+        if released {
+            let dragging = marquee.dragging;
+            let on_tile = point_on_tile(origin, marquee.start, columns, self.view.len());
+            self.selection = std::mem::take(&mut marquee.base);
+            if dragging {
+                // The band owns the final word on the set; swallow the
+                // release so it cannot double as a tile click.
+                return true;
+            }
+            if !on_tile {
+                // A press-and-release that never became a drag is a
+                // click: on bare sheet it means "select nothing".
+                self.selection.clear();
+            }
+            return false;
+        }
+        let Some(latest) = pointer else {
+            // Pointer left the window mid-press; stay armed until it
+            // reports again or the release arrives.
+            self.marquee = Some(marquee);
+            return false;
+        };
+        if !marquee.dragging && marquee.start.distance(latest) > MARQUEE_MIN_DRAG {
+            marquee.dragging = true;
+        }
+        if marquee.dragging {
+            let band = egui::Rect::from_two_pos(marquee.start, latest);
+            let covered: HashSet<PhotoId> =
+                covered_positions(origin, band, columns, self.view.len())
+                    .filter_map(|position| self.id_at(position))
+                    .collect();
+            self.selection = if marquee.additive {
+                marquee.base.union(&covered).copied().collect()
+            } else {
+                covered
+            };
+        }
+        self.marquee = Some(marquee);
+        false
+    }
+
+    /// Draws the active band over the tiles: translucent accent wash
+    /// with a hairline stroke, matching the selection language.
+    fn paint_marquee(&self, ui: &egui::Ui) {
+        let Some(marquee) = self.marquee.as_ref().filter(|marquee| marquee.dragging) else {
+            return;
+        };
+        let Some(latest) = ui.ctx().input(|input| input.pointer.latest_pos()) else {
+            return;
+        };
+        let band = egui::Rect::from_two_pos(marquee.start, latest);
+        let painter = ui.painter();
+        painter.rect_filled(band, 2.0, theme::ACCENT.gamma_multiply(0.12));
+        painter.rect_stroke(
+            band,
+            2.0,
+            egui::Stroke::new(1.0, theme::ACCENT.gamma_multiply(0.8)),
+            egui::StrokeKind::Inside,
+        );
+    }
+
     /// Virtualized tile sheet: only rows intersecting the viewport (plus a
     /// margin row, added by `show_rows`) allocate widgets or textures.
     /// Cells walk the filtered `view`, so hidden photos cost nothing.
@@ -612,10 +817,13 @@ impl GridView {
         let total_rows = self.view.len().div_ceil(columns);
         let view = &self.view;
         let entries = &self.entries;
+        let selection = &self.selection;
         let cursor = self.cursor;
         let mut visible_keys: Vec<TexKey> = Vec::new();
         let mut visible_pending: Vec<PhotoId> = Vec::new();
+        let mut first_tile: Option<(usize, egui::Rect)> = None;
         let mut clicked: Option<usize> = None;
+        let mut double_clicked: Option<usize> = None;
         let mut rows_shown = 0..0;
 
         // One-shot scroll-into-view after arrow/auto-advance/refilter
@@ -628,7 +836,7 @@ impl GridView {
                 row as f32 * (CELL_HEIGHT + GAP) + CELL_HEIGHT / 2.0 - ui.available_height() / 2.0;
             scroll = scroll.vertical_scroll_offset(centered.clamp(0.0, content_height));
         }
-        scroll.show_rows(ui, CELL_HEIGHT, total_rows, |ui, rows| {
+        let output = scroll.show_rows(ui, CELL_HEIGHT, total_rows, |ui, rows| {
             rows_shown = rows.clone();
             for row in rows {
                 ui.horizontal(|ui| {
@@ -641,30 +849,77 @@ impl GridView {
                             break;
                         };
                         visible_keys.push(TexKey::thumb(entry.id));
-                        if draw_cell(
+                        let hit = draw_cell(
                             ui,
                             textures,
                             entry,
                             cursor == Some(position),
+                            selection.contains(&entry.id),
                             &mut visible_pending,
-                        ) {
+                        );
+                        if first_tile.is_none() {
+                            // Anchors the marquee's screen-to-tile math:
+                            // allocation is exact even when the tile is
+                            // half scrolled out of view.
+                            first_tile = Some((position, hit.rect));
+                        }
+                        if hit.clicked {
                             clicked = Some(position);
+                        }
+                        if hit.double_clicked {
+                            double_clicked = Some(position);
                         }
                     }
                 });
             }
         });
+        // The on-screen viewport, excluding scroll bars: presses outside
+        // it (bars, chips) must not start a marquee.
+        let viewport = output.inner_rect;
 
         // Row-major traversal is already sorted; `focus` relies on that.
         visible_keys.sort_unstable();
         textures.focus(&visible_keys);
         self.prefetch_band(textures, rows_shown, columns, total_rows);
 
-        // Clicking a tile focuses it and opens the loupe on it
-        // (SPEC §6 Grid ⇄ Loupe).
-        if let Some(position) = clicked {
-            self.cursor = Some(position);
-            self.loupe = Some(loupe::LoupeView::at(position));
+        // Rubber band first so a finished drag can swallow the release
+        // that would otherwise land on a tile as a click (SPEC §6).
+        let origin = first_tile.map(|(position, rect)| tile_origin(position, rect, columns));
+        let release_consumed = self.step_marquee(ui, origin, columns, viewport);
+        self.paint_marquee(ui);
+
+        // Mouse path to the loupe is a double-click now that plain click
+        // selects; it mounts next frame like keyboard opens so the
+        // second click never leaks into the preview (SPEC §6).
+        if !release_consumed {
+            if let Some(position) = double_clicked {
+                self.cursor = Some(position);
+                self.anchor = Some(position);
+                self.selection = self.id_at(position).into_iter().collect();
+                self.open_requested = Some(position);
+            } else if let Some(position) = clicked {
+                let modifiers = ui.ctx().input(|input| input.modifiers);
+                self.cursor = Some(position);
+                if modifiers.shift {
+                    // Extend from the anchor through this tile, replacing
+                    // whatever was selected (SPEC §6 shift-click).
+                    let anchor = self.anchor.unwrap_or(position);
+                    self.selection = click_range(anchor, position)
+                        .filter_map(|slot| self.id_at(slot))
+                        .collect();
+                } else if modifiers.command_only() {
+                    if let Some(id) = self.id_at(position)
+                        && !self.selection.remove(&id)
+                    {
+                        self.selection.insert(id);
+                    }
+                } else {
+                    self.selection = self.id_at(position).into_iter().collect();
+                }
+                // Plain and Ctrl clicks both re-arm the range anchor;
+                // Shift keeps walking from wherever it last landed.
+                self.anchor = Some(position);
+            }
         }
 
         visible_pending.sort_unstable();
@@ -708,6 +963,31 @@ struct Tally {
     errors: usize,
 }
 
+/// Rubber-band drag over the sheet (SPEC §6 selection).
+struct Marquee {
+    /// Screen point where the press began; the band stretches to the
+    /// live pointer position.
+    start: egui::Pos2,
+    /// The selection as it stood at press time: ctrl-drag unions onto
+    /// it, an aborted drag hands it back untouched.
+    base: HashSet<PhotoId>,
+    /// Whether the press turned into a live drag (travel passed
+    /// [`MARQUEE_MIN_DRAG`]) or is still just a click candidate.
+    dragging: bool,
+    /// Ctrl held at press time: the band unions onto [`Self::base`]
+    /// instead of replacing it.
+    additive: bool,
+}
+
+/// What one tile reported this frame: its allocated rect anchors the
+/// marquee's screen-to-tile math, the flags drive click semantics
+/// (SPEC §6 selection).
+struct CellHit {
+    rect: egui::Rect,
+    clicked: bool,
+    double_clicked: bool,
+}
+
 /// Clickable `⚠ N` pill for extraction failures; jumps the cursor between
 /// error tiles on click (SPEC §6 status bar).
 fn draw_error_chip(ui: &mut egui::Ui, errors: usize) -> bool {
@@ -743,18 +1023,32 @@ fn draw_error_chip(ui: &mut egui::Ui, errors: usize) -> bool {
 
 /// One grid cell: panel rectangle, aspect-fit thumbnail (or spinner /
 /// error fallback) and the filename strip with its color-label dot.
-/// The keyboard cursor cell gets an accent border. Reports whether the
-/// cell was clicked (focus + open in loupe).
+/// Selected tiles get an accent wash plus hairline; the keyboard cursor
+/// a full accent ring on top (SPEC §6 cursor + selection). Reports the
+/// allocated rect and click events for the sheet's selection handling.
 fn draw_cell(
     ui: &mut egui::Ui,
     textures: &mut Textures,
     entry: &PhotoEntry,
     is_cursor: bool,
+    is_selected: bool,
     visible_pending: &mut Vec<PhotoId>,
-) -> bool {
+) -> CellHit {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(CELL_WIDTH, CELL_HEIGHT), egui::Sense::click());
     ui.painter().rect_filled(rect, 6.0, theme::PANEL);
+    if is_selected {
+        // Quieter than the cursor ring so a large batch reads as one
+        // mass without drowning the tile under it.
+        let painter = ui.painter();
+        painter.rect_filled(rect, 6.0, theme::ACCENT.gamma_multiply(0.10));
+        painter.rect_stroke(
+            rect,
+            6.0,
+            egui::Stroke::new(1.0, theme::ACCENT.gamma_multiply(0.55)),
+            egui::StrokeKind::Inside,
+        );
+    }
     if is_cursor {
         // Accent ring marks where digit keys will land (SPEC §6 cursor).
         ui.painter().rect_stroke(
@@ -776,10 +1070,14 @@ fn draw_cell(
         Some(message) => format!("{}\n⚠ {message}", entry.rel_path.display()),
         None => entry.rel_path.display().to_string(),
     };
-    // `on_hover_text` consumes the response, so read the click first.
-    let clicked = response.clicked();
+    // `on_hover_text` consumes the response, so read the clicks first.
+    let hit = CellHit {
+        rect,
+        clicked: response.clicked(),
+        double_clicked: response.double_clicked(),
+    };
     response.on_hover_text(tooltip);
-    clicked
+    hit
 }
 
 /// Image region of a cell: thumbnail when ready, spinner while pending or
@@ -901,6 +1199,95 @@ fn stepped_cursor(cursor: usize, key: egui::Key, columns: usize, len: usize) -> 
     Some(target.min(len - 1))
 }
 
+/// Screen-space top-left corner of view slot 0 in unbounded sheet
+/// geometry, derived from any one allocated tile — a tile's rect is exact
+/// even when half scrolled out of view, so the marquee never depends on
+/// scroll-area internals. Pure so the mapping is unit-testable.
+fn tile_origin(position: usize, rect: egui::Rect, columns: usize) -> egui::Pos2 {
+    let row = (position / columns.max(1)) as f32;
+    let column = (position % columns.max(1)) as f32;
+    egui::pos2(
+        rect.left() - column * (CELL_WIDTH + GAP),
+        rect.top() - row * (CELL_HEIGHT + GAP),
+    )
+}
+
+/// Rect of the tile at `position` in unbounded sheet geometry.
+fn tile_rect(origin: egui::Pos2, position: usize, columns: usize) -> egui::Rect {
+    let row = (position / columns.max(1)) as f32;
+    let column = (position % columns.max(1)) as f32;
+    egui::Rect::from_min_size(
+        egui::pos2(
+            origin.x + column * (CELL_WIDTH + GAP),
+            origin.y + row * (CELL_HEIGHT + GAP),
+        ),
+        egui::vec2(CELL_WIDTH, CELL_HEIGHT),
+    )
+}
+
+/// Filtered-order position under a screen point, or `None` off the
+/// sheet: left or above of the first tile, or past the last one. Pure so
+/// marquee behavior is unit-testable.
+fn position_at_point(
+    origin: egui::Pos2,
+    point: egui::Pos2,
+    columns: usize,
+    len: usize,
+) -> Option<usize> {
+    let column = ((point.x - origin.x) / (CELL_WIDTH + GAP)).floor();
+    let row = ((point.y - origin.y) / (CELL_HEIGHT + GAP)).floor();
+    if len == 0 || column < 0.0 || row < 0.0 {
+        return None;
+    }
+    let position = row as usize * columns.max(1) + column as usize;
+    (position < len).then_some(position)
+}
+
+/// `true` when the point sits inside some tile's rectangle; gaps between
+/// cells and the space below the last row count as bare sheet, which is
+/// what makes click-on-empty clear the selection (SPEC §6).
+fn point_on_tile(origin: egui::Pos2, point: egui::Pos2, columns: usize, len: usize) -> bool {
+    position_at_point(origin, point, columns, len)
+        .is_some_and(|position| tile_rect(origin, position, columns).contains(point))
+}
+
+/// Every tile position whose rectangle intersects `band`, clamped to the
+/// live set; drives rubber-band selection (SPEC §6 marquee). Row-major
+/// and ascending, so callers may rely on order.
+fn covered_positions(
+    origin: egui::Pos2,
+    band: egui::Rect,
+    columns: usize,
+    len: usize,
+) -> impl Iterator<Item = usize> {
+    let columns = columns.max(1);
+    let step_x = CELL_WIDTH + GAP;
+    let step_y = CELL_HEIGHT + GAP;
+    // A tile counts when its rect merely touches the band, hence the
+    // size offsets on the leading edges.
+    let first_column = (((band.left() - origin.x - CELL_WIDTH) / step_x)
+        .ceil()
+        .max(0.0)) as usize;
+    // Inclusive bounds clamped to the sheet's own shape: a wider band
+    // would only wrap columns into duplicate positions.
+    let last_column = ((((band.right() - origin.x) / step_x).floor().max(0.0)) as usize)
+        .min(first_column + columns - 1);
+    let first_row = (((band.top() - origin.y - CELL_HEIGHT) / step_y)
+        .ceil()
+        .max(0.0)) as usize;
+    let last_row = ((((band.bottom() - origin.y) / step_y).floor().max(0.0)) as usize)
+        .min(first_row + len.div_ceil(columns).saturating_sub(1));
+    (first_row..=last_row)
+        .flat_map(move |row| (first_column..=last_column).map(move |column| row * columns + column))
+        .take_while(move |&position| position < len.max(1))
+}
+
+/// Inclusive display-order span between two click endpoints, visiting
+/// order regardless of drag direction (SPEC §6 shift-click).
+fn click_range(anchor: usize, clicked: usize) -> std::ops::RangeInclusive<usize> {
+    anchor.min(clicked)..=anchor.max(clicked)
+}
+
 /// Largest centered rectangle with `aspect` that fits inside `container`.
 /// Shared with the loupe, which fits the same previews to the window.
 pub(crate) fn fit_rect(container: egui::Rect, aspect: f32) -> egui::Rect {
@@ -938,6 +1325,9 @@ fn root_label(root: &std::path::Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    // Test setup asserts hard failures; a broken fixture aborts the test.
+    #![expect(clippy::expect_used)]
+
     use super::*;
 
     #[test]
@@ -1151,5 +1541,243 @@ mod tests {
         grid.refilter();
 
         assert_eq!(grid.stats_line(), "1 / 2 shown");
+    }
+
+    // --- selection (SPEC §10 T12) ---
+
+    use cullr_core::Db;
+
+    use tempfile::TempDir;
+
+    fn db_for_tests() -> (TempDir, Db) {
+        let dir = TempDir::new().expect("temp dir");
+        let db = Db::open(&dir.path().join("index.db")).expect("open db");
+        (dir, db)
+    }
+
+    /// Grid whose rows exist in `db` too, so label persistence is
+    /// observable: ids come from a real scan-diff, not thin air.
+    fn grid_with_db(labels: &[TestLabel], db: &Db) -> GridView {
+        let root = std::path::Path::new("/photos");
+        let scanned: Vec<cullr_core::PhotoMeta> = labels
+            .iter()
+            .enumerate()
+            .map(|(index, _)| cullr_core::PhotoMeta {
+                root: root.to_owned(),
+                rel_path: format!("IMG_{:04}.CR3", index + 1).into(),
+                mtime: std::time::SystemTime::UNIX_EPOCH,
+                size: index as u64 + 1,
+            })
+            .collect();
+        let entries = db
+            .sync_scan(root, &scanned, cullr_core::ScanOptions::default())
+            .expect("sync");
+        let mut grid = GridView::new(root.to_owned(), false);
+        grid.apply_scan(Ok(entries));
+        grid
+    }
+
+    #[test]
+    fn position_at_point_should_map_points_to_tiles_and_reject_off_sheet_points() {
+        let columns = 3;
+        let origin = egui::pos2(100.0, 50.0);
+
+        assert_eq!(
+            position_at_point(origin, egui::pos2(100.0, 50.0), columns, 7),
+            Some(0),
+            "the sheet origin is tile zero's corner"
+        );
+        assert_eq!(
+            position_at_point(
+                origin,
+                egui::pos2(100.0 + CELL_WIDTH + GAP + 1.0, 60.0),
+                columns,
+                7
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            position_at_point(
+                origin,
+                egui::pos2(110.0, 50.0 + CELL_HEIGHT + GAP + 1.0),
+                columns,
+                7
+            ),
+            Some(3),
+            "one row down steps by the column count"
+        );
+        assert_eq!(
+            position_at_point(
+                origin,
+                egui::pos2(100.0 + 3.0 * (CELL_WIDTH + GAP) + 5.0, 60.0),
+                columns,
+                2
+            ),
+            None,
+            "past the last tile there is nothing to address"
+        );
+        assert_eq!(
+            position_at_point(origin, egui::pos2(50.0, 60.0), columns, 7),
+            None
+        );
+        assert_eq!(
+            position_at_point(origin, egui::pos2(120.0, 10.0), columns, 7),
+            None
+        );
+    }
+
+    #[test]
+    fn point_on_tile_should_exclude_gaps_and_trailing_space() {
+        let columns = 2;
+        let origin = egui::Pos2::ZERO;
+
+        assert!(point_on_tile(
+            origin,
+            egui::pos2(CELL_WIDTH - 1.0, CELL_HEIGHT - 1.0),
+            columns,
+            4
+        ));
+        assert!(
+            !point_on_tile(origin, egui::pos2(CELL_WIDTH + GAP / 2.0, 5.0), columns, 4),
+            "the gap between cells is bare sheet"
+        );
+        // One row down with only one row of tiles: bare space.
+        assert!(!point_on_tile(
+            origin,
+            egui::pos2(5.0, CELL_HEIGHT + GAP + 1.0),
+            columns,
+            2
+        ));
+    }
+
+    #[test]
+    fn covered_positions_should_take_every_intersecting_tile() {
+        let columns = 3;
+        let origin = egui::Pos2::ZERO;
+        // A small band straddling the corner shared by tiles 0, 1, 3, 4.
+        let band = egui::Rect::from_min_max(
+            egui::pos2(CELL_WIDTH - 2.0, CELL_HEIGHT - 2.0),
+            egui::pos2(CELL_WIDTH + GAP + 2.0, CELL_HEIGHT + GAP + 2.0),
+        );
+
+        let covered: Vec<usize> = covered_positions(origin, band, columns, 9).collect();
+
+        assert_eq!(covered, vec![0, 1, 3, 4]);
+    }
+
+    #[test]
+    fn covered_positions_should_clamp_to_the_live_set() {
+        let columns = 3;
+        let origin = egui::Pos2::ZERO;
+        let band = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(10_000.0, 10_000.0));
+
+        assert_eq!(covered_positions(origin, band, columns, 7).count(), 7);
+    }
+
+    #[test]
+    fn click_range_should_order_its_endpoints() {
+        assert_eq!(click_range(4, 1), 1..=4);
+        assert_eq!(click_range(2, 2), 2..=2);
+    }
+
+    #[test]
+    fn select_all_should_cover_only_the_filtered_view() {
+        let mut grid = grid_with(&[TestLabel::None, TestLabel::Red, TestLabel::None]);
+        grid.filter.toggle(TestLabel::Red);
+        grid.refilter();
+
+        grid.select_all();
+
+        // Only the surviving red photo joins; hidden tiles never join a
+        // batch (SPEC §6 Ctrl+A).
+        assert_eq!(grid.selection.len(), 1);
+        assert!(grid.selection.contains(&cullr_core::PhotoId(2)));
+    }
+
+    #[test]
+    fn refilter_should_keep_selection_membership_of_hidden_photos() {
+        let mut grid = grid_with(&[TestLabel::None, TestLabel::Red]);
+        grid.select_all();
+        grid.filter.toggle(TestLabel::Red);
+
+        grid.refilter();
+
+        assert_eq!(grid.view.len(), 1);
+        assert_eq!(grid.selection.len(), 2, "ids outlive their hiding");
+    }
+
+    #[test]
+    fn apply_label_should_relabel_a_hundred_selected_photos_in_one_keystroke() {
+        let (_dir, db) = db_for_tests();
+        let mut grid = grid_with_db(&[TestLabel::None; 100], &db);
+        grid.select_all();
+
+        grid.apply_label(&db, TestLabel::Red);
+
+        assert!(
+            grid.entries
+                .iter()
+                .all(|entry| entry.label == TestLabel::Red)
+        );
+        for entry in &grid.entries {
+            let stored = db.photo_entry(entry.id).expect("read").expect("row");
+            assert_eq!(stored.label, TestLabel::Red);
+        }
+    }
+
+    #[test]
+    fn apply_label_should_fall_back_to_the_cursor_when_nothing_is_selected() {
+        let (_dir, db) = db_for_tests();
+        let mut grid = grid_with_db(&[TestLabel::None, TestLabel::None], &db);
+        grid.cursor = Some(0);
+
+        grid.apply_label(&db, TestLabel::Green);
+
+        assert_eq!(grid.entries[0].label, TestLabel::Green);
+        assert_eq!(grid.entries[1].label, TestLabel::None);
+        let stored = db
+            .photo_entry(grid.entries[0].id)
+            .expect("read")
+            .expect("row");
+        assert_eq!(stored.label, TestLabel::Green);
+    }
+
+    #[test]
+    fn apply_label_should_skip_already_labeled_rows_in_a_batch() {
+        let (_dir, db) = db_for_tests();
+        let mut grid = grid_with(&[TestLabel::None, TestLabel::Red]);
+        grid.select_all();
+
+        grid.apply_label(&db, TestLabel::Red);
+
+        // The already-red row keeps its label untouched either way; both
+        // end red with only one real UPDATE behind them.
+        assert!(
+            grid.entries
+                .iter()
+                .all(|entry| entry.label == TestLabel::Red)
+        );
+    }
+
+    #[test]
+    fn select_none_should_empty_the_set_but_keep_the_cursor() {
+        let mut grid = grid_with(&[TestLabel::None, TestLabel::None]);
+        grid.cursor = Some(1);
+        grid.select_all();
+
+        grid.selection.clear();
+
+        assert!(grid.selection.is_empty());
+        assert_eq!(grid.cursor, Some(1));
+    }
+
+    #[test]
+    fn stats_line_should_count_the_selection_while_present() {
+        let mut grid = grid_with(&[TestLabel::None, TestLabel::None]);
+
+        assert_eq!(grid.stats_line(), "2 photos");
+        grid.select_all();
+
+        assert_eq!(grid.stats_line(), "2 photos · 2 selected");
     }
 }
