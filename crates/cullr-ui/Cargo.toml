@@ -1,0 +1,18 @@
+[package]
+name = "cullr-ui"
+description = "Cullr — Photo Mechanic-style culling tool for RAW photographs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+cullr-core = { path = "../cullr-core" }
+eframe.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

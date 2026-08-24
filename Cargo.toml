@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = ["crates/cullr-core", "crates/cullr-ui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+authors = ["Cullr contributors"]
+
+[workspace.dependencies]
+eframe = "0.36"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[workspace.lints.rust]
+missing_docs = "deny"
+
+[workspace.lints.clippy]
+all = "deny"
+perf = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+redundant_clone = "deny"
+needless_collect = "deny"
+
+[profile.release]
+lto = "thin"

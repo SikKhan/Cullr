@@ -1,0 +1,15 @@
+[package]
+name = "cullr-core"
+description = "GUI-free engine behind Cullr: scanning, preview extraction, thumbnailing, index DB, labels."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+
+[lints]
+workspace = true
