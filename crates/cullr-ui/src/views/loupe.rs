@@ -69,17 +69,21 @@ impl LoupeView {
     /// Draws the screen, consumes input, and reports the next action.
     ///
     /// `entries` is mutable so digit labels update the sheet's source of
-    /// truth in place; `auto_advance` is shared with the grid because Tab
-    /// works in whichever view is on screen (SPEC §6).
+    /// truth in place; `order` is the grid's filtered view (positions into
+    /// `entries`, SPEC §6 "arrows navigate within filtered order") and
+    /// `index` addresses it, so navigation skips filtered-out photos.
+    /// `auto_advance` is shared with the grid because Tab works in
+    /// whichever view is on screen (SPEC §6).
     pub fn ui(
         &mut self,
         ui: &mut egui::Ui,
         db: &Db,
         entries: &mut [PhotoEntry],
+        order: &[usize],
         textures: &mut Textures,
         auto_advance: &mut bool,
     ) -> Outcome {
-        if entries.is_empty() || self.index >= entries.len() {
+        if order.is_empty() || self.index >= order.len() {
             return Outcome::Close;
         }
         let (left, right, escape, enter) = ui.ctx().input(|input| {
@@ -97,7 +101,7 @@ impl LoupeView {
         if left && self.index > 0 {
             self.move_to(self.index - 1);
         }
-        if right && self.index + 1 < entries.len() {
+        if right && self.index + 1 < order.len() {
             self.move_to(self.index + 1);
         }
         // Cull-pass keys: Tab flips the persisted advance mode, digits
@@ -107,10 +111,11 @@ impl LoupeView {
             widgets::store_auto_advance(db, *auto_advance);
         }
         if let Some(label) = widgets::pressed_label_key(ui.ctx()) {
-            self.apply_label(entries, db, label, *auto_advance);
+            self.apply_label(entries, order, db, label, *auto_advance);
         }
 
-        let entry = &entries[self.index];
+        let row = order[self.index];
+        let entry = &entries[row];
         let current_label = entry.label;
         let detail = fetch_detail(db, entry.id);
 
@@ -119,8 +124,9 @@ impl LoupeView {
         // Each neighbour needs its own row for the preview asset path;
         // the per-photo point queries are microsecond-scale.
         textures.focus(&[TexKey::screen(entry.id)]);
-        for position in neighbor_indices(self.index, entries.len(), NEIGHBOR_REACH) {
-            let Some(neighbor) = entries.get(position) else {
+        for position in neighbor_indices(self.index, order.len(), NEIGHBOR_REACH) {
+            let neighbor_row = order[position];
+            let Some(neighbor) = entries.get(neighbor_row) else {
                 continue;
             };
             if neighbor.status != PhotoStatus::Ok {
@@ -187,7 +193,7 @@ impl LoupeView {
             image_area,
             detail.as_ref(),
             self.index + 1,
-            entries.len(),
+            order.len(),
         );
         let swatch_pick = draw_exif_bar(
             ui,
@@ -198,16 +204,22 @@ impl LoupeView {
             *auto_advance,
         );
         if let Some(label) = swatch_pick {
-            self.apply_label(entries, db, label, *auto_advance);
+            self.apply_label(entries, order, db, label, *auto_advance);
         }
 
         Outcome::Stay
     }
 
-    /// Position in the folder order currently on display; the grid picks
-    /// it up as its cursor when the loupe closes.
+    /// Position in the filtered folder order currently on display; the
+    /// grid picks it up as its cursor when the loupe closes.
     pub fn index(&self) -> usize {
         self.index
+    }
+
+    /// Re-anchors the loupe after the surrounding filter changed: lands
+    /// on `index` in the new order, reset to fit like any navigation.
+    pub fn jump_to(&mut self, index: usize) {
+        self.move_to(index);
     }
 
     /// Persists a label instantly (single UPDATE, SPEC §6) and mirrors it
@@ -218,11 +230,15 @@ impl LoupeView {
     fn apply_label(
         &mut self,
         entries: &mut [PhotoEntry],
+        order: &[usize],
         db: &Db,
         label: Label,
         auto_advance: bool,
     ) {
-        let Some(entry) = entries.get_mut(self.index) else {
+        let Some(&row) = order.get(self.index) else {
+            return;
+        };
+        let Some(entry) = entries.get_mut(row) else {
             return;
         };
         if entry.label != label {
@@ -231,7 +247,7 @@ impl LoupeView {
                 tracing::warn!(%error, id = entry.id.0, "cannot persist label");
             }
         }
-        if auto_advance && self.index + 1 < entries.len() {
+        if auto_advance && self.index + 1 < order.len() {
             self.move_to(self.index + 1);
         }
     }
@@ -444,7 +460,11 @@ fn draw_position_overlay(
     ordinal: usize,
     total: usize,
 ) {
-    let counter = format!("{} / {}", grouped(ordinal), grouped(total));
+    let counter = format!(
+        "{} / {}",
+        widgets::grouped(ordinal),
+        widgets::grouped(total)
+    );
     let galley = painter.layout_no_wrap(counter, egui::FontId::proportional(12.0), theme::TEXT);
     let dot_diameter = 9.0;
     let gap = 8.0;
@@ -577,20 +597,6 @@ fn trim_number(value: f64) -> String {
     } else {
         format!("{value:.1}")
     }
-}
-
-/// Thousands grouping with narrow no-break spaces, as in `3 210`.
-fn grouped(value: usize) -> String {
-    let digits = value.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3 * '\u{202f}'.len_utf8());
-    for (index, digit) in digits.chars().enumerate() {
-        // Separator goes where exactly three digits remain behind it.
-        if index > 0 && (digits.len() - index) % 3 == 0 {
-            out.push('\u{202f}');
-        }
-        out.push(digit);
-    }
-    out
 }
 
 fn file_name(entry: &PhotoEntry) -> String {
@@ -737,14 +743,6 @@ mod tests {
             err_msg: None,
         };
         assert_eq!(max_zoom(&entry, egui::vec2(500.0, 500.0)), 1.0);
-    }
-
-    #[test]
-    fn grouped_should_insert_narrow_spaces_every_three_digits() {
-        assert_eq!(grouped(7), "7");
-        assert_eq!(grouped(142), "142");
-        assert_eq!(grouped(3210), "3\u{202f}210");
-        assert_eq!(grouped(1_234_567), "1\u{202f}234\u{202f}567");
     }
 
     fn detail(fields: impl FnOnce(&mut PhotoDetail)) -> PhotoDetail {

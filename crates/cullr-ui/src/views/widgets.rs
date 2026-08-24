@@ -3,6 +3,8 @@
 //! Everything here is view-agnostic: the grid and the loupe both label
 //! photos with digits `1..5` / `0` (SPEC §6), both show the palette as
 //! clickable swatches, and both honor the persisted auto-advance toggle.
+//! The filter bar (chips + counts, SPEC §6) is also defined here so its
+//! [`LabelFilter`] state type stays decoupled from any one view.
 
 use eframe::egui;
 
@@ -13,6 +15,249 @@ use crate::theme;
 
 /// kv row backing the auto-advance toggle so it survives restarts.
 const AUTO_ADVANCE_KEY: &str = "auto_advance";
+
+/// Bit for [`Label::None`] inside [`LabelFilter::mask`].
+const UNLABELED_BIT: u8 = 1;
+/// Bitmask selecting every colored label (`Red..=Purple`).
+const LABELED_MASK: u8 = 0b0011_1110;
+
+/// Active label-filter selection over a folder's photos (SPEC §6).
+///
+/// A bitmask of selected labels with OR semantics: an empty selection
+/// shows everything, `{unlabeled}` shows only unmarked photos and any mix
+/// of color bits shows photos carrying at least one of them. The `F` key
+/// cycles the three presets All → Labeled → Unlabeled; chips toggle
+/// individual labels on top.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LabelFilter {
+    /// Bit per [`Label::to_u8`] value; zero means "no filtering".
+    mask: u8,
+}
+
+impl LabelFilter {
+    /// The unfiltered preset.
+    pub const fn all() -> Self {
+        Self { mask: 0 }
+    }
+
+    /// The Labeled preset: every photo carrying any color mark.
+    pub const fn labeled() -> Self {
+        Self { mask: LABELED_MASK }
+    }
+
+    /// The Unlabeled preset: only photos without a mark.
+    pub const fn unlabeled() -> Self {
+        Self {
+            mask: UNLABELED_BIT,
+        }
+    }
+
+    /// `true` when nothing is filtered out.
+    pub fn is_all(self) -> bool {
+        self.mask == 0
+    }
+
+    /// Whether photos carrying `label` survive this filter.
+    ///
+    /// With no selection everything matches; otherwise membership is a
+    /// single bit test, which is what keeps a refilter over 10k rows
+    /// inside one frame (SPEC §10 T11 acceptance).
+    pub fn matches(self, label: Label) -> bool {
+        self.mask == 0 || self.mask & (1 << label.to_u8()) != 0
+    }
+
+    /// Whether `label`'s chip is currently toggled on.
+    pub fn is_selected(self, label: Label) -> bool {
+        !self.is_all() && self.mask & (1 << label.to_u8()) != 0
+    }
+
+    /// Flips one label's chip; toggling the last bit off returns to All.
+    pub fn toggle(&mut self, label: Label) {
+        self.mask ^= 1 << label.to_u8();
+    }
+
+    /// Drops back to the unfiltered preset.
+    pub fn clear(&mut self) {
+        self.mask = 0;
+    }
+
+    /// Advances All → Labeled → Unlabeled → All (SPEC §6 keyboard map).
+    /// A custom chip mix counts as "before Labeled", so pressing `F`
+    /// always lands on a named preset in at most two presses.
+    pub fn cycle_preset(&mut self) {
+        *self = if *self == Self::unlabeled() {
+            Self::all()
+        } else if *self == Self::labeled() {
+            Self::unlabeled()
+        } else {
+            Self::labeled()
+        };
+    }
+}
+
+/// Which filter chip the user activated in [`filter_chips`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilterChip {
+    /// The `[All]` reset chip.
+    All,
+    /// One of the six label chips (`○` or a color dot).
+    Label(Label),
+}
+
+/// Pill height shared by every chip.
+const CHIP_HEIGHT: f32 = 22.0;
+/// Horizontal padding inside a chip.
+const CHIP_PADDING: f32 = 9.0;
+/// Gap between chips.
+const CHIP_GAP: f32 = 6.0;
+/// Diameter of the colored dot inside label chips.
+const CHIP_DOT: f32 = 7.0;
+/// Space between the dot and the count text.
+const CHIP_DOT_GAP: f32 = 5.0;
+
+/// Draws the filter bar: `[All] [○ n] [R n][Y n][G n][B n][P n]` pills
+/// with per-chip photo counts (SPEC §6). Active chips glow in their own
+/// accent; reports the clicked chip so the caller owns the state change.
+pub fn filter_chips(
+    ui: &mut egui::Ui,
+    filter: LabelFilter,
+    counts: &[usize; 6],
+) -> Option<FilterChip> {
+    let mut picked = None;
+    ui.spacing_mut().item_spacing.x = CHIP_GAP;
+    ui.horizontal(|ui| {
+        if draw_chip(
+            ui,
+            &ChipLook::All(filter.is_all()),
+            None,
+            "show every photo",
+        ) {
+            picked = Some(FilterChip::All);
+        }
+        for label in [
+            Label::None,
+            Label::Red,
+            Label::Yellow,
+            Label::Green,
+            Label::Blue,
+            Label::Purple,
+        ] {
+            let count = counts[label.to_u8() as usize];
+            let look = match label {
+                Label::None => ChipLook::Unlabeled(filter.is_selected(label)),
+                color => ChipLook::Color(theme::label_color(color), filter.is_selected(color)),
+            };
+            let name = format!("{}-only", label_name(label));
+            if draw_chip(ui, &look, Some(count), &name) {
+                picked = Some(FilterChip::Label(label));
+            }
+        }
+    });
+    picked
+}
+
+/// Visual recipe of one filter chip: its accent source and active state.
+#[derive(Clone, Copy)]
+enum ChipLook {
+    /// Reset chip; lit while no filter is engaged.
+    All(bool),
+    /// Hollow-circle chip for unmarked photos.
+    Unlabeled(bool),
+    /// Color-dot chip for one label color.
+    Color(egui::Color32, bool),
+}
+
+impl ChipLook {
+    fn active(self) -> bool {
+        match self {
+            ChipLook::All(active) | ChipLook::Unlabeled(active) | ChipLook::Color(_, active) => {
+                active
+            }
+        }
+    }
+
+    fn accent(self) -> egui::Color32 {
+        match self {
+            ChipLook::All(..) => theme::ACCENT,
+            ChipLook::Unlabeled(..) => theme::TEXT,
+            ChipLook::Color(color, ..) => color,
+        }
+    }
+
+    fn has_dot(self) -> bool {
+        !matches!(self, ChipLook::All(_))
+    }
+}
+
+/// Paints one pill chip and reports whether it was clicked. Width comes
+/// from measuring the count text, so `9 999+` counts still fit cleanly.
+fn draw_chip(ui: &mut egui::Ui, look: &ChipLook, count: Option<usize>, hint: &str) -> bool {
+    let text_font = egui::FontId::proportional(12.0);
+    let text = count.map_or_else(String::new, grouped);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text, text_font, egui::Color32::WHITE);
+    let dot_width = if look.has_dot() {
+        CHIP_DOT + CHIP_DOT_GAP
+    } else {
+        0.0
+    };
+    let size = egui::vec2(
+        CHIP_PADDING * 2.0 + dot_width + galley.size().x,
+        CHIP_HEIGHT,
+    );
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let painter = ui.painter();
+    let (active, accent) = (look.active(), look.accent());
+    // Active chips get a translucent wash of their own accent plus a
+    // crisp ring; idle ones stay quiet so the bar reads as available
+    // filters rather than buttons demanding clicks.
+    let fill = if active {
+        accent.gamma_multiply(0.22)
+    } else {
+        theme::PANEL
+    };
+    let stroke = if active {
+        egui::Stroke::new(1.25, accent)
+    } else {
+        egui::Stroke::new(1.0, theme::MUTED.gamma_multiply(0.45))
+    };
+    painter.rect_filled(rect, CHIP_HEIGHT / 2.0, fill);
+    painter.rect_stroke(rect, CHIP_HEIGHT / 2.0, stroke, egui::StrokeKind::Inside);
+
+    let mut cursor_x = rect.left() + CHIP_PADDING;
+    if let ChipLook::Color(color, _) = look {
+        painter.circle_filled(
+            egui::pos2(cursor_x + CHIP_DOT / 2.0, rect.center().y),
+            CHIP_DOT / 2.0,
+            *color,
+        );
+        cursor_x += CHIP_DOT + CHIP_DOT_GAP;
+    } else if look.has_dot() {
+        painter.circle_stroke(
+            egui::pos2(cursor_x + CHIP_DOT / 2.0, rect.center().y),
+            CHIP_DOT / 2.0,
+            egui::Stroke::new(1.25, theme::MUTED),
+        );
+        cursor_x += CHIP_DOT + CHIP_DOT_GAP;
+    }
+    painter.galley(
+        egui::pos2(cursor_x, rect.center().y - galley.size().y / 2.0),
+        galley,
+        if active { theme::TEXT } else { theme::MUTED },
+    );
+
+    let clicked = response.clicked();
+    response.on_hover_text(match count {
+        Some(count) => format!(
+            "{hint} · {} photo{}",
+            grouped(count),
+            if count == 1 { "" } else { "s" }
+        ),
+        None => hint.to_owned(),
+    });
+    clicked
+}
 
 /// Digit keys in label order: `0` clears, `1..5` assign (SPEC §6).
 const LABEL_KEYS: [(egui::Key, Label); 6] = [
@@ -127,16 +372,33 @@ pub fn label_swatches(ui: &mut egui::Ui, current: Label) -> Option<Label> {
     picked
 }
 
-/// Human name for a label, used in tooltips.
+/// Human name for a label, used in tooltips and chip hints.
 fn label_name(label: Label) -> &'static str {
     match label {
-        Label::None => "clear",
+        Label::None => "unlabeled",
         Label::Red => "red",
         Label::Yellow => "yellow",
         Label::Green => "green",
         Label::Blue => "blue",
         Label::Purple => "purple",
     }
+}
+
+/// Thousands grouping with narrow no-break spaces, as in `3 210`.
+///
+/// Lives here because the loupe's position pill, the status stats and the
+/// filter-chip counts all render user-facing magnitudes.
+pub fn grouped(value: usize) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3 * '\u{202f}'.len_utf8());
+    for (index, digit) in digits.chars().enumerate() {
+        // Separator goes where exactly three digits remain behind it.
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push('\u{202f}');
+        }
+        out.push(digit);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -165,5 +427,94 @@ mod tests {
         store_auto_advance(&db, true);
 
         assert!(load_auto_advance(&db));
+    }
+
+    #[test]
+    fn empty_filter_should_match_every_label() {
+        let filter = LabelFilter::all();
+        for label in Label::ALL {
+            assert!(filter.matches(label), "{label:?} must survive All");
+            assert!(!filter.is_selected(label));
+        }
+    }
+
+    #[test]
+    fn labeled_preset_should_hide_unmarked_photos_only() {
+        let filter = LabelFilter::labeled();
+        assert!(!filter.matches(Label::None));
+        for color in [
+            Label::Red,
+            Label::Yellow,
+            Label::Green,
+            Label::Blue,
+            Label::Purple,
+        ] {
+            assert!(filter.matches(color), "{color:?} must survive Labeled");
+        }
+    }
+
+    #[test]
+    fn unlabeled_preset_should_keep_only_unmarked_photos() {
+        let filter = LabelFilter::unlabeled();
+        assert!(filter.matches(Label::None));
+        assert!(!filter.matches(Label::Green));
+    }
+
+    #[test]
+    fn toggled_chips_should_select_labels_with_or_semantics() {
+        let mut filter = LabelFilter::all();
+        filter.toggle(Label::Red);
+        filter.toggle(Label::Blue);
+        assert!(!filter.is_all());
+        assert!(filter.is_selected(Label::Red));
+        assert!(filter.matches(Label::Blue));
+        assert!(!filter.matches(Label::Yellow), "untoggled colors stay out");
+        assert!(!filter.matches(Label::None));
+        filter.toggle(Label::Red);
+
+        assert!(
+            !filter.matches(Label::Red),
+            "clicking an active chip deselects it"
+        );
+        assert!(filter.matches(Label::Blue), "the other chip survives");
+    }
+
+    #[test]
+    fn cycle_preset_should_walk_all_labeled_unlabeled_and_back() {
+        let mut filter = LabelFilter::all();
+        filter.cycle_preset();
+        assert_eq!(filter, LabelFilter::labeled());
+        filter.cycle_preset();
+        assert_eq!(filter, LabelFilter::unlabeled());
+        filter.cycle_preset();
+        assert!(filter.is_all(), "the cycle must close back on All");
+    }
+
+    #[test]
+    fn cycle_preset_should_land_on_a_named_preset_from_custom_mixes() {
+        let mut filter = LabelFilter::all();
+        filter.toggle(Label::Purple);
+
+        filter.cycle_preset();
+
+        assert_eq!(filter, LabelFilter::labeled(), "custom mixes act as All");
+    }
+
+    #[test]
+    fn clear_should_return_to_the_unfiltered_preset() {
+        let mut filter = LabelFilter::unlabeled();
+
+        filter.clear();
+
+        assert!(filter.is_all());
+        assert!(filter.matches(Label::Red));
+    }
+
+    #[test]
+    fn grouped_should_insert_narrow_spaces_every_three_digits() {
+        assert_eq!(grouped(7), "7");
+        assert_eq!(grouped(142), "142");
+        assert_eq!(grouped(3210), "3\u{202f}210");
+        assert_eq!(grouped(1_234_567), "1\u{202f}234\u{202f}567");
     }
 }
