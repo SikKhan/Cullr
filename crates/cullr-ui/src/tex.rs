@@ -131,7 +131,12 @@ impl Default for Limits {
 
 impl Limits {
     /// After an overflow, evict down to this level so the LRU sort does
-    /// not run every frame while streaming through a large folder.
+    /// not run every frame while streaming through a large folder. The
+    /// band between target and budget (25 % ≈ 128 MB in production) is
+    /// sized to absorb a long burst of uploads between eviction passes:
+    /// over a hundred grid thumbs at ~1 MB RGBA8 each, or more than one
+    /// worst-case loupe screen — enough hysteresis that steady scrolling
+    /// costs one sort per ~128 MB uploaded instead of per frame.
     fn evict_target(&self) -> usize {
         self.byte_budget * 3 / 4
     }
@@ -449,6 +454,11 @@ impl Textures {
             .collect();
         order.sort_unstable();
         let mut bytes = self.bytes;
+        // Evicted bytes must leave `self.bytes` too; counting them only in
+        // this local sum would inflate the counter permanently, silently
+        // shrinking the effective budget towards the evict target and
+        // turning every later sync into an unnecessary eviction pass.
+        let mut evicted = 0usize;
         let mut victims = 0;
         for (index, (_, key)) in order.iter().enumerate() {
             if bytes <= self.limits.evict_target() {
@@ -456,12 +466,14 @@ impl Textures {
             }
             if let Some(slot) = self.slots.get(key) {
                 bytes -= slot.bytes;
+                evicted += slot.bytes;
             }
             victims = index + 1;
         }
         for (_, key) in &order[..victims] {
             self.slots.remove(key);
         }
+        self.bytes -= evicted;
     }
 }
 
@@ -543,6 +555,8 @@ fn decode_jpeg(path: &Path) -> Result<egui::ColorImage, String> {
 #[cfg(test)]
 mod tests {
     #![expect(clippy::expect_used)]
+
+    use std::collections::HashSet;
 
     use super::*;
 
@@ -674,6 +688,141 @@ mod tests {
             !textures.slots.contains_key(&TexKey::thumb(PhotoId(2))),
             "LRU victim survived"
         );
+    }
+
+    #[test]
+    fn eviction_should_keep_recently_visible_textures() {
+        let env = Env::new();
+        // 16×12 RGBA8 = 768 B per texture; seven competing uploads overflow
+        // the 2400 B budget repeatedly, forcing evictions down to the 1800 B
+        // target while the burst streams through.
+        let limits = Limits {
+            byte_budget: 2400,
+            ..prod_limits()
+        };
+        let files: Vec<PathBuf> = (0..7)
+            .map(|index| env.jpeg(&format!("vis-{index}.jpg"), 16, 12))
+            .collect();
+        let mut textures = textures_with(limits);
+        for (index, file) in files.iter().enumerate() {
+            textures.handle(TexKey::thumb(PhotoId(index as u64)), Some(file));
+        }
+        // Highest id also wins recency ties, mirroring a cell that stays on
+        // screen while everything around it scrolls past.
+        let hot = TexKey::thumb(PhotoId(999));
+
+        let settled = env.settle(|| {
+            // Re-demanding the hot key refreshes its recency every frame,
+            // exactly like a visible cell repainted by the grid.
+            textures.handle(hot, Some(files.last().expect("non-empty").as_path()));
+            textures.sync(&env.ctx);
+            !textures.busy()
+        });
+
+        assert!(settled, "burst never settled");
+        assert!(
+            textures.slots.contains_key(&hot),
+            "recently visible texture was evicted during the burst"
+        );
+    }
+
+    #[test]
+    fn eviction_should_settle_at_the_hysteresis_level_and_keep_survivors() {
+        let env = Env::new();
+        // Six 16×12 textures = 4608 B overflow the 2200 B budget; eviction
+        // must stop once bytes reach its 1650 B target instead of running
+        // to zero.
+        let limits = Limits {
+            byte_budget: 2200,
+            ..prod_limits()
+        };
+        let evict_target = limits.evict_target();
+        let files: Vec<PathBuf> = (0..6)
+            .map(|index| env.jpeg(&format!("hyst-{index}.jpg"), 16, 12))
+            .collect();
+        let mut textures = textures_with(limits);
+        for (index, file) in files.iter().enumerate() {
+            textures.handle(TexKey::thumb(PhotoId(index as u64)), Some(file));
+        }
+        let _ = env.settle(|| {
+            textures.sync(&env.ctx);
+            !textures.busy()
+        });
+        // One extra pass so the assertions observe post-eviction state even
+        // if settle returned on the same frame as the final upload.
+        textures.sync(&env.ctx);
+
+        assert!(
+            textures.bytes <= evict_target,
+            "eviction overshot the hysteresis level: {} B resident vs {evict_target} B target",
+            textures.bytes
+        );
+        assert!(
+            !textures.slots.is_empty(),
+            "hysteresis eviction emptied the cache entirely"
+        );
+    }
+
+    #[test]
+    fn retain_should_drop_non_kept_ids_from_every_cache_layer() {
+        let env = Env::new();
+        let kept_file = env.jpeg("kept.jpg", 8, 6);
+        let gone_file = env.jpeg("gone.jpg", 8, 6);
+        let mut textures = textures_with(prod_limits());
+        let kept = TexKey::thumb(PhotoId(1));
+        let gone = TexKey::thumb(PhotoId(2));
+
+        textures.handle(kept, Some(&kept_file));
+        textures.handle(gone, Some(&gone_file));
+        let _ = env.settle(|| {
+            textures.sync(&env.ctx);
+            textures.slots.len() == 2
+        });
+
+        let keep: HashSet<PhotoId> = [PhotoId(1)].into_iter().collect();
+        textures.retain(&keep);
+
+        assert!(
+            !textures.slots.contains_key(&gone),
+            "closed-folder texture survived retain"
+        );
+        assert!(
+            !textures.pending.contains_key(&gone),
+            "closed-folder decode job survived retain"
+        );
+        assert_eq!(
+            textures.bytes, textures.slots[&kept].bytes,
+            "byte accounting drifted after retain"
+        );
+        assert!(
+            !textures.busy(),
+            "closed-folder work kept the pipeline busy"
+        );
+    }
+
+    #[test]
+    fn prefetch_should_skip_keys_already_resident_or_in_flight() {
+        let env = Env::new();
+        let file = env.jpeg("dedup.jpg", 8, 6);
+        let mut textures = textures_with(prod_limits());
+        let key = TexKey::thumb(PhotoId(6));
+
+        textures.handle(key, Some(&file));
+        textures.prefetch([(key, Some(file.as_path()))].into_iter());
+
+        assert_eq!(
+            textures.pending.len(),
+            1,
+            "prefetch duplicated an in-flight demand"
+        );
+
+        let _ = env.settle(|| {
+            textures.sync(&env.ctx);
+            matches!(textures.handle(key, Some(&file)), TextureState::Ready(_))
+        });
+        textures.prefetch([(key, Some(file.as_path()))].into_iter());
+
+        assert!(!textures.busy(), "prefetch requeued a resident texture");
     }
 
     #[test]
