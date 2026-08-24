@@ -12,6 +12,10 @@ thiserror.workspace = true
 tracing.workspace = true
 walkdir.workspace = true
 rusqlite.workspace = true
+rawler.workspace = true
+image.workspace = true
+md-5.workspace = true
+dirs.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

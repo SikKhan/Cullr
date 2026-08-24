@@ -12,11 +12,12 @@ use walkdir::{DirEntry, WalkDir};
 
 use crate::model::PhotoMeta;
 
-/// RAW file extensions recognized by the scanner, lowercase without dot.
+/// RAW file extensions recognized by culling, lowercase without dot.
 ///
-/// This is the hardcoded half of the SPEC §5.1 filter; once extraction lands,
-/// it is intersected with rawler's supported set at the `extract.rs` boundary.
-const EXTENSIONS: &[&[u8]] = &[
+/// This is the hardcoded half of the SPEC §5.1 filter; [`crate::extract`]
+/// intersects it with rawler's supported set at runtime, so this list alone
+/// does not make an extension ingestable.
+pub(crate) const EXTENSIONS: &[&[u8]] = &[
     b"3fr", b"ari", b"arw", b"bay", b"cr2", b"cr3", b"crw", b"dcr", b"dng", b"erf", b"fff", b"gpr",
     b"iiq", b"kdc", b"mef", b"mrw", b"nef", b"nrw", b"orf", b"pef", b"raf", b"raw", b"rw2", b"rwl",
     b"sr2", b"srw", b"x3f",
@@ -98,10 +99,7 @@ fn has_raw_extension(file_name: &OsStr) -> bool {
     let Some(dot) = bytes.iter().rposition(|&b| b == b'.') else {
         return false;
     };
-    let ext = &bytes[dot + 1..];
-    EXTENSIONS
-        .iter()
-        .any(|known| known.eq_ignore_ascii_case(ext))
+    crate::extract::is_supported_extension(&bytes[dot + 1..])
 }
 
 fn to_photo_meta(root: &Path, entry: DirEntry) -> Option<PhotoMeta> {

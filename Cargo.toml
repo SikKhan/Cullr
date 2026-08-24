@@ -17,6 +17,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2"
 rusqlite = { version = "0.37", features = ["bundled"] }
+rawler = "=0.7.2"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+md-5 = "0.10"
 tempfile = "3"
 crossbeam-channel = "0.5"
 dirs = "6"

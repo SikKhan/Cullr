@@ -21,11 +21,16 @@
 //! assert_eq!(photos.len(), 1);
 //! ```
 
+pub mod cache;
 pub mod db;
+pub mod exif;
+pub mod extract;
 pub mod model;
 pub mod scanner;
 
+pub use cache::{Cache, CacheError};
 pub use db::{Db, DbError, now_millis};
+pub use extract::{ExtractError, extract_file, is_supported_extension};
 pub use model::{IngestInfo, Label, PhotoEntry, PhotoId, PhotoMeta, PhotoStatus};
 pub use scanner::{ScanError, ScanOptions, scan_folder};
 
