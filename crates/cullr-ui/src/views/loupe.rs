@@ -14,6 +14,7 @@
 use eframe::egui;
 
 use cullr_core::Db;
+use cullr_core::Label;
 use cullr_core::PhotoDetail;
 use cullr_core::PhotoEntry;
 use cullr_core::PhotoStatus;
@@ -22,6 +23,7 @@ use crate::tex::TexKey;
 use crate::tex::TextureState;
 use crate::tex::Textures;
 use crate::theme;
+use crate::views::widgets;
 
 /// Zoom multiplier at fit-to-window; all zooming lives in `[1, max]`.
 const FIT_ZOOM: f32 = 1.0;
@@ -65,12 +67,17 @@ impl LoupeView {
     }
 
     /// Draws the screen, consumes input, and reports the next action.
+    ///
+    /// `entries` is mutable so digit labels update the sheet's source of
+    /// truth in place; `auto_advance` is shared with the grid because Tab
+    /// works in whichever view is on screen (SPEC §6).
     pub fn ui(
         &mut self,
         ui: &mut egui::Ui,
         db: &Db,
-        entries: &[PhotoEntry],
+        entries: &mut [PhotoEntry],
         textures: &mut Textures,
+        auto_advance: &mut bool,
     ) -> Outcome {
         if entries.is_empty() || self.index >= entries.len() {
             return Outcome::Close;
@@ -93,8 +100,18 @@ impl LoupeView {
         if right && self.index + 1 < entries.len() {
             self.move_to(self.index + 1);
         }
+        // Cull-pass keys: Tab flips the persisted advance mode, digits
+        // label the photo on display and (when armed) walk forward.
+        if widgets::tab_pressed(ui.ctx()) {
+            *auto_advance = !*auto_advance;
+            widgets::store_auto_advance(db, *auto_advance);
+        }
+        if let Some(label) = widgets::pressed_label_key(ui.ctx()) {
+            self.apply_label(entries, db, label, *auto_advance);
+        }
 
         let entry = &entries[self.index];
+        let current_label = entry.label;
         let detail = fetch_detail(db, entry.id);
 
         // Focus cancels stale neighbour decodes when flying through the
@@ -172,9 +189,51 @@ impl LoupeView {
             self.index + 1,
             entries.len(),
         );
-        draw_exif_bar(ui.painter(), area, detail.as_ref(), entry);
+        let swatch_pick = draw_exif_bar(
+            ui,
+            area,
+            detail.as_ref(),
+            entry,
+            current_label,
+            *auto_advance,
+        );
+        if let Some(label) = swatch_pick {
+            self.apply_label(entries, db, label, *auto_advance);
+        }
 
         Outcome::Stay
+    }
+
+    /// Position in the folder order currently on display; the grid picks
+    /// it up as its cursor when the loupe closes.
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    /// Persists a label instantly (single UPDATE, SPEC §6) and mirrors it
+    /// into the sheet's row so tiles refresh without a re-read. With
+    /// auto-advance armed every labeling keystroke also walks to the next
+    /// photo; re-labeling with the same color still advances, because the
+    /// keystroke means "decided", not "changed".
+    fn apply_label(
+        &mut self,
+        entries: &mut [PhotoEntry],
+        db: &Db,
+        label: Label,
+        auto_advance: bool,
+    ) {
+        let Some(entry) = entries.get_mut(self.index) else {
+            return;
+        };
+        if entry.label != label {
+            entry.label = label;
+            if let Err(error) = db.set_label(entry.id, label) {
+                tracing::warn!(%error, id = entry.id.0, "cannot persist label");
+            }
+        }
+        if auto_advance && self.index + 1 < entries.len() {
+            self.move_to(self.index + 1);
+        }
     }
 
     /// Jumps to `index` and recenters: every photo starts at fit.
@@ -424,27 +483,61 @@ fn draw_position_overlay(
     );
 }
 
-/// Bottom bar with the EXIF summary (`camera · lens · f/x · shutter ·
-/// ISO · mm · timestamp`), falling back to the file name.
+/// Bottom bar: EXIF summary on the left (clipped before the palette),
+/// the auto-advance state and clickable label swatches on the right.
+/// Reports a swatch click as the label to apply.
 fn draw_exif_bar(
-    painter: &egui::Painter,
+    ui: &mut egui::Ui,
     area: egui::Rect,
     detail: Option<&PhotoDetail>,
     entry: &PhotoEntry,
-) {
+    current_label: Label,
+    auto_advance: bool,
+) -> Option<Label> {
     let bar = egui::Rect::from_min_max(
         egui::pos2(area.left(), area.bottom() - BAR_HEIGHT),
         area.right_bottom(),
     );
-    painter.rect_filled(bar, 0.0, theme::PANEL);
+    ui.painter().rect_filled(bar, 0.0, theme::PANEL);
+
+    // Palette block, vertically centered in the bar; `label_swatches`
+    // owns its own hit-testing through a child UI pinned to this rect.
+    let swatch_left = bar.right() - widgets::SWATCH_STRIP_WIDTH;
+    let swatch_rect = egui::Rect::from_min_size(
+        egui::pos2(swatch_left, bar.center().y - widgets::SWATCH_DIAMETER / 2.0),
+        egui::vec2(widgets::SWATCH_STRIP_WIDTH, widgets::SWATCH_DIAMETER),
+    );
+    let picked = {
+        let mut palette = ui.new_child(egui::UiBuilder::new().max_rect(swatch_rect));
+        widgets::label_swatches(&mut palette, current_label)
+    };
+
+    // Tiny mode flag so fullscreen culling still shows whether labeling
+    // walks forward; sits just left of the palette.
+    let flag = if auto_advance { "⏭" } else { "⏸" };
+    ui.painter().text(
+        egui::pos2(swatch_left - 24.0, bar.center().y),
+        egui::Align2::CENTER_CENTER,
+        flag,
+        egui::FontId::proportional(11.0),
+        if auto_advance {
+            theme::ACCENT
+        } else {
+            theme::MUTED
+        },
+    );
+
+    // Summary line gets whatever width the right-hand controls leave it.
     let line = detail.map_or_else(|| file_name(entry), |detail| exif_line(detail, entry));
-    painter.text(
+    let text_clip = egui::Rect::from_min_max(bar.min, egui::pos2(swatch_left - 40.0, bar.max.y));
+    ui.painter().with_clip_rect(text_clip).text(
         egui::pos2(bar.left() + 12.0, bar.center().y),
         egui::Align2::LEFT_CENTER,
         line,
         egui::FontId::proportional(12.0),
         theme::MUTED,
     );
+    picked
 }
 
 /// Builds the EXIF summary line; absent fields are skipped rather than

@@ -21,6 +21,7 @@ use crate::tex::Textures;
 use crate::views::Action;
 use crate::views::grid::GridView;
 use crate::views::home::HomeView;
+use crate::views::widgets;
 
 /// Repaint cadence while background work (scan, ingest, decode) is
 /// outstanding; short enough that spinners and progressive fills look live.
@@ -105,7 +106,8 @@ impl App {
             pipeline.cancel();
         }
         self.scanning = Some(root.clone());
-        self.screen = Screen::Grid(Box::new(GridView::new(root.clone())));
+        let auto_advance = widgets::load_auto_advance(&self.db);
+        self.screen = Screen::Grid(Box::new(GridView::new(root.clone(), auto_advance)));
         let db = Arc::clone(&self.db);
         let sender = self.events_tx.clone();
         // Scan is a cheap walk + tiny upserts (< 300 ms @ 10k per SPEC §8);

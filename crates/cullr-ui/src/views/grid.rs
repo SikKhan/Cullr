@@ -21,6 +21,7 @@ use cullr_core::PhotoStatus;
 
 use super::Action;
 use super::loupe;
+use super::widgets;
 use crate::tex::{TexKey, TextureState, Textures};
 use crate::theme;
 
@@ -44,6 +45,14 @@ const SPINNER_SIZE: f32 = 22.0;
 /// Rows decoded ahead of the viewport above and below it (SPEC §5.3
 /// neighbor prefetch) so steady scrolling finds tiles already resident.
 const PREFETCH_ROWS: usize = 2;
+/// Arrow keys that move the sheet cursor; column count turns ↑/↓ into
+/// whole-row steps.
+const NAV_KEYS: [egui::Key; 4] = [
+    egui::Key::ArrowLeft,
+    egui::Key::ArrowRight,
+    egui::Key::ArrowUp,
+    egui::Key::ArrowDown,
+];
 
 /// State of the Grid screen for the folder being browsed.
 pub struct GridView {
@@ -59,6 +68,19 @@ pub struct GridView {
     last_ping: Vec<PhotoId>,
     /// Ping waiting to be collected by the app, if any.
     ping: Option<Vec<PhotoId>>,
+    /// Keyboard cursor in the sheet (SPEC §6): arrows move it, digits
+    /// label its photo, Enter/Space open the loupe on it. Starts on the
+    /// first tile so keys work the moment a folder is open.
+    cursor: Option<usize>,
+    /// Cursor row queued for a one-shot scroll-into-view.
+    scroll_target: Option<usize>,
+    /// Auto-advance-after-label, persisted across sessions (SPEC §6).
+    auto_advance: bool,
+    /// Loupe position queued by a keyboard open. Creation waits for the
+    /// next frame because the opening keypress must not leak into the
+    /// loupe's own handlers (Space would start it zoomed, Enter would
+    /// close it instantly).
+    open_requested: Option<usize>,
     /// Full-screen preview state while the loupe is open; `None` shows
     /// the contact sheet (SPEC §6: Grid ⇄ Loupe).
     loupe: Option<loupe::LoupeView>,
@@ -66,8 +88,9 @@ pub struct GridView {
 
 impl GridView {
     /// Creates the view in its scanning state; contents arrive later via
-    /// [`Self::apply_scan`] (SPEC §5.1 placeholders-first).
-    pub fn new(root: PathBuf) -> Self {
+    /// [`Self::apply_scan`] (SPEC §5.1 placeholders-first). `auto_advance`
+    /// arrives pre-loaded from the persisted kv setting.
+    pub fn new(root: PathBuf, auto_advance: bool) -> Self {
         Self {
             root,
             entries: Vec::new(),
@@ -78,6 +101,10 @@ impl GridView {
             ingest_done: 0,
             last_ping: Vec::new(),
             ping: None,
+            cursor: None,
+            scroll_target: None,
+            auto_advance,
+            open_requested: None,
             loupe: None,
         }
     }
@@ -93,6 +120,9 @@ impl GridView {
                     .map(|(index, entry)| (entry.id, index))
                     .collect();
                 self.entries = entries;
+                // Keys must work before any click, so the cursor arms on
+                // the first tile as soon as the folder resolves.
+                self.cursor = (!self.entries.is_empty()).then_some(0);
             }
             Err(message) => self.error = Some(message),
         }
@@ -156,16 +186,52 @@ impl GridView {
         textures: &mut Textures,
     ) -> Option<Action> {
         let mut action = None;
-        // Keyboard-first navigation: while the loupe is up it owns Esc
-        // (back to the sheet); otherwise Esc leaves the grid entirely.
-        if self.loupe.is_none() && ui.ctx().input(|input| input.key_pressed(egui::Key::Escape)) {
-            action = Some(Action::BackToHome);
+        let columns = columns_for_width(ui.available_width()).max(1);
+        // Mount a loupe queued last frame before any input handling, so
+        // its first drawn frame starts with fresh key state.
+        if self.loupe.is_none() {
+            self.loupe = self.open_requested.take().map(loupe::LoupeView::at);
+        }
+        // Keyboard-first navigation. While the loupe is up it owns every
+        // key (Esc back, digits label); on the sheet, Esc leaves the
+        // folder and the rest drives cursor + labeling (SPEC §6).
+        if self.loupe.is_none() && !self.entries.is_empty() {
+            let (escape, enter, space, nav) = ui.ctx().input(|input| {
+                (
+                    input.key_pressed(egui::Key::Escape),
+                    input.key_pressed(egui::Key::Enter),
+                    input.key_pressed(egui::Key::Space),
+                    NAV_KEYS.into_iter().find(|key| input.key_pressed(*key)),
+                )
+            });
+            if escape {
+                action = Some(Action::BackToHome);
+            }
+            if widgets::tab_pressed(ui.ctx()) {
+                self.auto_advance = !self.auto_advance;
+                widgets::store_auto_advance(db, self.auto_advance);
+            }
+            if let Some(label) = widgets::pressed_label_key(ui.ctx()) {
+                self.label_cursor(db, label);
+            }
+            if let Some(key) = nav
+                && let Some(cursor) = self.cursor
+                && let Some(next) = stepped_cursor(cursor, key, columns, self.entries.len())
+            {
+                self.cursor = Some(next);
+                self.scroll_target = Some(next);
+            }
+            // Full keyboard cull pass: Enter/Space jump into the loupe at
+            // the cursor so digits keep flowing without touching the mouse.
+            if enter || space {
+                self.open_requested = Some(self.cursor.unwrap_or(0));
+            }
         }
 
         egui::Panel::top(egui::Id::new("cullr_grid_top_bar")).show(ui, |ui| {
             self.top_bar(ui, &mut action);
         });
-        egui::CentralPanel::default().show(ui, |ui| self.body(ui, db, textures));
+        egui::CentralPanel::default().show(ui, |ui| self.body(ui, db, textures, columns));
 
         action
     }
@@ -203,19 +269,38 @@ impl GridView {
             };
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(egui::RichText::new(count).color(theme::MUTED));
+                ui.separator();
+                // Live state of the cull-pass mode; the tooltip carries
+                // the shortcut since the bar has no room for hints.
+                let (text, color) = if self.auto_advance {
+                    ("auto-advance on", theme::ACCENT)
+                } else {
+                    ("auto-advance off", theme::MUTED)
+                };
+                ui.label(egui::RichText::new(text).color(color))
+                    .on_hover_text("Tab — after labeling, jump to the next photo");
             });
         });
     }
 
     /// Body: loupe when open, otherwise scanning notice, failure notice,
     /// empty notice or tile sheet.
-    fn body(&mut self, ui: &mut egui::Ui, db: &cullr_core::Db, textures: &mut Textures) {
+    fn body(
+        &mut self,
+        ui: &mut egui::Ui,
+        db: &cullr_core::Db,
+        textures: &mut Textures,
+        columns: usize,
+    ) {
         if let Some(active) = self.loupe.as_mut() {
-            // The loupe borrows the sheet's entries in place so ingest
-            // events keep flowing into the same source of truth; its
+            // The loupe mutates the sheet's rows in place (labels land in
+            // the same source of truth) and shares the advance toggle; its
             // index stays valid because rows never leave mid-session.
-            let outcome = active.ui(ui, db, &self.entries, textures);
+            let outcome = active.ui(ui, db, &mut self.entries, textures, &mut self.auto_advance);
             if outcome == loupe::Outcome::Close {
+                // Resume sheet navigation where the preview left off.
+                self.cursor = Some(active.index());
+                self.scroll_target = Some(active.index());
                 self.loupe = None;
             }
             return;
@@ -267,7 +352,34 @@ impl GridView {
             return;
         }
 
-        self.draw_sheet(ui, textures);
+        self.draw_sheet(ui, textures, columns);
+    }
+
+    /// Applies a digit label to the photo under the cursor: instant
+    /// persist (single UPDATE) mirrored into the row so the strip dot
+    /// refreshes immediately. Auto-advance then steps forward, exactly
+    /// like the loupe's flow (SPEC §6).
+    fn label_cursor(&mut self, db: &cullr_core::Db, label: cullr_core::Label) {
+        let Some(cursor) = self.cursor else {
+            return;
+        };
+        let Some(entry) = self.entries.get_mut(cursor) else {
+            return;
+        };
+        if entry.label != label {
+            entry.label = label;
+            if let Err(error) = db.set_label(entry.id, label) {
+                tracing::warn!(%error, id = entry.id.0, "cannot persist label");
+            }
+        }
+        if self.auto_advance {
+            let last = self.entries.len().saturating_sub(1);
+            let next = (cursor + 1).min(last);
+            if next != cursor {
+                self.cursor = Some(next);
+                self.scroll_target = Some(next);
+            }
+        }
     }
 
     /// Virtualized tile sheet: only rows intersecting the viewport (plus a
@@ -276,46 +388,59 @@ impl GridView {
     /// The visible id set feeds the texture manager's focus (scroll-driven
     /// decode cancellation) and a band of neighbouring rows is prefetched,
     /// both after drawing so they see the settled viewport.
-    fn draw_sheet(&mut self, ui: &mut egui::Ui, textures: &mut Textures) {
+    fn draw_sheet(&mut self, ui: &mut egui::Ui, textures: &mut Textures, columns: usize) {
         ui.spacing_mut().item_spacing = egui::vec2(GAP, GAP);
-        let columns = columns_for_width(ui.available_width()).max(1);
         let total_rows = self.entries.len().div_ceil(columns);
         let entries = &self.entries;
+        let cursor = self.cursor;
         let mut visible_keys: Vec<TexKey> = Vec::new();
         let mut visible_pending: Vec<PhotoId> = Vec::new();
         let mut clicked: Option<usize> = None;
         let mut rows_shown = 0..0;
 
-        egui::ScrollArea::vertical().auto_shrink(false).show_rows(
-            ui,
-            CELL_HEIGHT,
-            total_rows,
-            |ui, rows| {
-                rows_shown = rows.clone();
-                for row in rows {
-                    ui.horizontal(|ui| {
-                        for column in 0..columns {
-                            let position = row * columns + column;
-                            let Some(entry) = entries.get(position) else {
-                                break;
-                            };
-                            visible_keys.push(TexKey::thumb(entry.id));
-                            if draw_cell(ui, textures, entry, &mut visible_pending) {
-                                clicked = Some(position);
-                            }
+        // One-shot scroll-into-view after arrow/auto-advance moves:
+        // egui 0.36 has no request-a-row API, so the pixel offset of the
+        // target row is computed and applied exactly once.
+        let mut scroll = egui::ScrollArea::vertical().auto_shrink(false);
+        if let Some(row) = self.scroll_target.take() {
+            let content_height = total_rows.max(1) as f32 * CELL_HEIGHT + GAP;
+            let centered =
+                row as f32 * (CELL_HEIGHT + GAP) + CELL_HEIGHT / 2.0 - ui.available_height() / 2.0;
+            scroll = scroll.vertical_scroll_offset(centered.clamp(0.0, content_height));
+        }
+        scroll.show_rows(ui, CELL_HEIGHT, total_rows, |ui, rows| {
+            rows_shown = rows.clone();
+            for row in rows {
+                ui.horizontal(|ui| {
+                    for column in 0..columns {
+                        let position = row * columns + column;
+                        let Some(entry) = entries.get(position) else {
+                            break;
+                        };
+                        visible_keys.push(TexKey::thumb(entry.id));
+                        if draw_cell(
+                            ui,
+                            textures,
+                            entry,
+                            cursor == Some(position),
+                            &mut visible_pending,
+                        ) {
+                            clicked = Some(position);
                         }
-                    });
-                }
-            },
-        );
+                    }
+                });
+            }
+        });
 
         // Row-major traversal is already sorted; `focus` relies on that.
         visible_keys.sort_unstable();
         textures.focus(&visible_keys);
         self.prefetch_band(textures, rows_shown, columns, total_rows);
 
-        // Clicking a tile opens the loupe on it (SPEC §6 Grid ⇄ Loupe).
+        // Clicking a tile focuses it and opens the loupe on it
+        // (SPEC §6 Grid ⇄ Loupe).
         if let Some(position) = clicked {
+            self.cursor = Some(position);
             self.loupe = Some(loupe::LoupeView::at(position));
         }
 
@@ -355,16 +480,27 @@ impl GridView {
 
 /// One grid cell: panel rectangle, aspect-fit thumbnail (or spinner /
 /// error fallback) and the filename strip with its color-label dot.
-/// Reports whether the cell was clicked (open in loupe).
+/// The keyboard cursor cell gets an accent border. Reports whether the
+/// cell was clicked (focus + open in loupe).
 fn draw_cell(
     ui: &mut egui::Ui,
     textures: &mut Textures,
     entry: &PhotoEntry,
+    is_cursor: bool,
     visible_pending: &mut Vec<PhotoId>,
 ) -> bool {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(CELL_WIDTH, CELL_HEIGHT), egui::Sense::click());
     ui.painter().rect_filled(rect, 6.0, theme::PANEL);
+    if is_cursor {
+        // Accent ring marks where digit keys will land (SPEC §6 cursor).
+        ui.painter().rect_stroke(
+            rect,
+            6.0,
+            egui::Stroke::new(2.0, theme::ACCENT),
+            egui::StrokeKind::Inside,
+        );
+    }
 
     let image_area = egui::Rect::from_min_max(
         egui::pos2(rect.left() + CELL_PADDING, rect.top() + CELL_PADDING),
@@ -487,6 +623,21 @@ fn columns_for_width(width: f32) -> usize {
     ((width + GAP) / (CELL_WIDTH + GAP)).floor().max(0.0) as usize
 }
 
+/// Cursor position after an arrow press: left/right step by one, up/down
+/// by a full row. Every move clamps inside the set instead of wrapping,
+/// so the cursor is never flung to the far side of the sheet; `None`
+/// means the key was not navigational or the move ran into an edge.
+fn stepped_cursor(cursor: usize, key: egui::Key, columns: usize, len: usize) -> Option<usize> {
+    let target = match key {
+        egui::Key::ArrowLeft => cursor.checked_sub(1)?,
+        egui::Key::ArrowRight => cursor + 1,
+        egui::Key::ArrowUp => cursor.checked_sub(columns.max(1))?,
+        egui::Key::ArrowDown => cursor + columns.max(1),
+        _ => return None,
+    };
+    Some(target.min(len - 1))
+}
+
 /// Largest centered rectangle with `aspect` that fits inside `container`.
 /// Shared with the loupe, which fits the same previews to the window.
 pub(crate) fn fit_rect(container: egui::Rect, aspect: f32) -> egui::Rect {
@@ -575,5 +726,42 @@ mod tests {
         let cut = truncated(long.as_str().into());
         assert!(cut.starts_with('…'));
         assert!(cut.ends_with(".CR3"));
+    }
+
+    #[test]
+    fn stepped_cursor_should_step_by_one_horizontally() {
+        assert_eq!(stepped_cursor(4, egui::Key::ArrowRight, 5, 10), Some(5));
+        assert_eq!(stepped_cursor(4, egui::Key::ArrowLeft, 5, 10), Some(3));
+    }
+
+    #[test]
+    fn stepped_cursor_should_clamp_at_set_edges() {
+        assert_eq!(stepped_cursor(9, egui::Key::ArrowRight, 5, 10), Some(9));
+        assert_eq!(stepped_cursor(0, egui::Key::ArrowLeft, 5, 10), None);
+    }
+
+    #[test]
+    fn stepped_cursor_should_step_whole_rows_vertically() {
+        // Three columns: down from position 1 lands on 4.
+        assert_eq!(stepped_cursor(1, egui::Key::ArrowDown, 3, 10), Some(4));
+        assert_eq!(stepped_cursor(4, egui::Key::ArrowUp, 3, 10), Some(1));
+    }
+
+    #[test]
+    fn stepped_cursor_should_stop_inside_the_last_row() {
+        // Ten items in three columns end at position 9; moving down from
+        // the middle of the last row settles on the final item.
+        assert_eq!(stepped_cursor(7, egui::Key::ArrowDown, 3, 10), Some(9));
+    }
+
+    #[test]
+    fn stepped_cursor_should_refuse_moves_off_the_top() {
+        // First row has no row above to move into.
+        assert_eq!(stepped_cursor(1, egui::Key::ArrowUp, 3, 10), None);
+    }
+
+    #[test]
+    fn stepped_cursor_should_ignore_non_navigational_keys() {
+        assert_eq!(stepped_cursor(3, egui::Key::Space, 5, 10), None);
     }
 }

@@ -6,6 +6,7 @@
 pub mod grid;
 pub mod home;
 pub mod loupe;
+pub mod widgets;
 
 use std::path::PathBuf;
 
