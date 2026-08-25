@@ -44,13 +44,14 @@ use crate::model::{
 use crate::scanner::ScanOptions;
 
 /// Schema revision this build understands; bumped with every migration.
-const LATEST_VERSION: i64 = 1;
+const LATEST_VERSION: i64 = 2;
 
 /// Migration scripts indexed by target version minus one.
 ///
 /// Each script runs inside one transaction together with its `user_version`
 /// bump, so an interrupted upgrade rolls back cleanly on next open.
-const MIGRATIONS: &[&str] = &[r#"
+const MIGRATIONS: &[&str] = &[
+    r#"
 CREATE TABLE photos (
   id          INTEGER PRIMARY KEY,
   root        TEXT NOT NULL,
@@ -72,7 +73,13 @@ CREATE INDEX idx_photos_root  ON photos(root);
 CREATE INDEX idx_photos_label ON photos(root, label);
 CREATE TABLE roots (id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL, last_opened INTEGER NOT NULL);
 CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);
-"#];
+"#,
+    r#"
+-- v2: user-applied display rotation. Quarter-turns clockwise stacked on
+-- top of the EXIF orientation flag; survives re-ingest like `label` does.
+ALTER TABLE photos ADD COLUMN rot_cw INTEGER NOT NULL DEFAULT 0;
+"#,
+];
 
 /// Failure modes of index database operations.
 #[derive(Error, Debug)]
@@ -301,6 +308,44 @@ impl Db {
         })
     }
 
+    /// Persists a user display rotation as a single UPDATE: `turns` are
+    /// quarter-turns clockwise (0–3) stacked on the EXIF orientation.
+    /// Values outside `0..4` wrap; unknown ids are logged and ignored like
+    /// in [`Self::set_label`].
+    pub fn set_rotation(&self, id: PhotoId, turns: u8) -> Result<(), DbError> {
+        self.with_conn(|conn| {
+            let updated = conn.execute(
+                "UPDATE photos SET rot_cw = ?2 WHERE id = ?1",
+                params![narrow_u64(id.0), turns % 4],
+            )?;
+            if updated == 0 {
+                tracing::warn!(?id, "set_rotation ignored unknown photo id");
+            }
+            Ok(())
+        })
+    }
+
+    /// Persists many rotations in one transaction, mirroring
+    /// [`Self::set_labels`]: one commit however large the batch, so a
+    /// hundred-photo rotate costs one fsync.
+    pub fn set_rotations(&self, updates: &[(PhotoId, u8)]) -> Result<(), DbError> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        self.with_conn(|conn| {
+            let tx = conn.transaction()?;
+            {
+                let mut update =
+                    tx.prepare_cached("UPDATE photos SET rot_cw = ?2 WHERE id = ?1")?;
+                for &(id, turns) in updates {
+                    update.execute(params![narrow_u64(id.0), turns % 4])?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     /// Records a successful ingest, attaching metadata and cache paths.
     pub fn record_ingest_ok(&self, id: PhotoId, info: &IngestInfo) -> Result<(), DbError> {
         self.with_conn(|conn| {
@@ -356,7 +401,7 @@ impl Db {
     pub fn photo_entry(&self, id: PhotoId) -> Result<Option<PhotoEntry>, DbError> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare_cached(
-                "SELECT rel_path, label, status, width, height, orientation, thumb_path, err_msg
+                "SELECT rel_path, label, status, width, height, orientation, thumb_path, err_msg, rot_cw
                  FROM photos WHERE id = ?1",
             )?;
             let mut rows = stmt.query([narrow_u64(id.0)])?;
@@ -381,7 +426,7 @@ impl Db {
             let mut stmt = conn.prepare_cached(
                 "SELECT rel_path, label, status, width, height, orientation,
                         preview_path, thumb_path, camera, lens, taken_at,
-                        shutter, aperture, iso, focal_mm, err_msg
+                        shutter, aperture, iso, focal_mm, err_msg, rot_cw
                  FROM photos WHERE id = ?1",
             )?;
             let mut rows = stmt.query([narrow_u64(id.0)])?;
@@ -415,6 +460,7 @@ impl Db {
                         }),
                         focal_mm: row.get(14)?,
                         err_msg: row.get(15)?,
+                        rot_cw: rot_cw_of(row.get::<_, i64>(16)?),
                     }))
                 }
             }
@@ -546,7 +592,7 @@ fn load_existing(
 fn load_entries(tx: &rusqlite::Transaction<'_>, root: &str) -> Result<Vec<PhotoEntry>, DbError> {
     // Missing rows stay out of navigation entirely (SPEC §7).
     let mut stmt = tx.prepare(
-        "SELECT id, rel_path, label, status, width, height, orientation, thumb_path, err_msg
+        "SELECT id, rel_path, label, status, width, height, orientation, thumb_path, err_msg, rot_cw
          FROM photos WHERE root = ?1 AND status <> 3",
     )?;
     let rows = stmt.query_map([root], |row| {
@@ -567,7 +613,8 @@ fn load_entries(tx: &rusqlite::Transaction<'_>, root: &str) -> Result<Vec<PhotoE
 /// Assembles a [`PhotoEntry`] from the cell-facing columns of a `photos`
 /// row. `rel_path` comes from the caller because the two query shapes
 /// select it at different positions; `base` is the column index of `label`
-/// followed by `status, width, height, orientation, thumb_path, err_msg`.
+/// followed by `status, width, height, orientation, thumb_path, err_msg,
+/// rot_cw`.
 fn entry_from_row(
     id: PhotoId,
     rel_path: PathBuf,
@@ -588,9 +635,16 @@ fn entry_from_row(
         status: PhotoStatus::from_u8(u8::try_from(status).unwrap_or(0)).unwrap_or_default(),
         pixels,
         orientation: u16::try_from(row.get::<_, i64>(base + 4)?).unwrap_or(1),
+        rot_cw: rot_cw_of(row.get::<_, i64>(base + 7)?),
         thumb_path: row.get::<_, Option<String>>(base + 5)?.map(PathBuf::from),
         err_msg: row.get(base + 6)?,
     })
+}
+
+/// Clamps a stored `rot_cw` into the canonical `0..4` range; out-of-range
+/// or negative values (hand-edited DBs) wrap rather than panic.
+fn rot_cw_of(value: i64) -> u8 {
+    value.rem_euclid(4) as u8
 }
 
 fn is_nested(rel_path: &Path) -> bool {
@@ -700,6 +754,7 @@ mod tests {
             status: PhotoStatus::Pending,
             pixels: None,
             orientation: 1,
+            rot_cw: 0,
             thumb_path: None,
             err_msg: None,
         }
@@ -1392,6 +1447,108 @@ mod tests {
             ),
             Label::Blue.to_u8() as i64
         );
+    }
+
+    #[test]
+    fn set_rotation_should_wrap_and_persist_across_reopen() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("index.db");
+        let root = dir.path();
+        let db = Db::open(&path).expect("open");
+        let scanned = vec![meta(root, "a.nef", 1, 10)];
+        let entries = db
+            .sync_scan(root, &scanned, ScanOptions::default())
+            .expect("sync");
+        let id = entries[0].id;
+        // Three CW turns wrap to one CCW turn; the stored value must be
+        // canonical 0..4 either way.
+        db.set_rotation(id, 7).expect("rotate");
+        drop(db);
+
+        let reopened = Db::open(&path).expect("reopen");
+        let entry = reopened.photo_entry(id).expect("read").expect("row exists");
+        assert_eq!(entry.rot_cw, 3);
+    }
+
+    #[test]
+    fn set_rotations_should_land_every_update_in_one_commit() {
+        let fx = open_db();
+        let root = fx._dir.path();
+        let scanned = vec![meta(root, "a.nef", 1, 10), meta(root, "b.arw", 2, 20)];
+        let entries = fx
+            .db
+            .sync_scan(root, &scanned, ScanOptions::default())
+            .expect("sync");
+
+        fx.db
+            .set_rotations(&[(entries[0].id, 1), (entries[1].id, 3)])
+            .expect("batch rotate");
+        // Empty batches are a cheap no-op.
+        fx.db.set_rotations(&[]).expect("empty batch");
+
+        assert_eq!(
+            scalar(
+                &fx.db,
+                &format!("SELECT rot_cw FROM photos WHERE id = {}", entries[0].id.0)
+            ),
+            1
+        );
+        assert_eq!(
+            scalar(
+                &fx.db,
+                &format!("SELECT rot_cw FROM photos WHERE id = {}", entries[1].id.0)
+            ),
+            3
+        );
+    }
+
+    #[test]
+    fn rotation_should_survive_a_file_change_and_reingest() {
+        let fx = open_db();
+        let root = fx._dir.path();
+        let original = vec![meta(root, "a.nef", 1, 10)];
+        let first = fx
+            .db
+            .sync_scan(root, &original, ScanOptions::default())
+            .expect("first sync");
+        fx.db.set_rotation(first[0].id, 2).expect("rotate");
+
+        // The file was edited on disk: the row resets for re-extraction,
+        // but the user's display rotation is a preference, like the label.
+        let changed = vec![meta(root, "a.nef", 9, 999)];
+        let second = fx
+            .db
+            .sync_scan(root, &changed, ScanOptions::default())
+            .expect("resync");
+
+        assert_eq!(second[0].status, PhotoStatus::Pending);
+        assert_eq!(second[0].rot_cw, 2);
+    }
+
+    #[test]
+    fn open_should_migrate_a_v1_database_to_v2_with_rotation_defaults() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("index.db");
+        {
+            // Build a genuine v1 database with one ingested photo.
+            let conn = Connection::open(&path).expect("raw open");
+            conn.execute_batch(MIGRATIONS[0]).expect("v1 schema");
+            conn.execute_batch(
+                "INSERT INTO photos (root, rel_path, mtime, size, status) VALUES
+                 ('/p', 'a.nef', 1, 10, 1);",
+            )
+            .expect("seed row");
+            conn.pragma_update(None, "user_version", 1)
+                .expect("stamp v1");
+        }
+
+        let db = Db::open(&path).expect("migrating open");
+        let entry = db
+            .photo_entry(PhotoId(1))
+            .expect("read")
+            .expect("row survives migration");
+        assert_eq!(entry.rot_cw, 0);
+        assert_eq!(scalar(&db, "PRAGMA user_version"), LATEST_VERSION);
     }
 
     #[test]

@@ -160,6 +160,9 @@ pub struct PhotoEntry {
     /// EXIF orientation flag (`1..8`) that must be applied on top of
     /// [`PhotoEntry::pixels`] for display; defaults to upright (`1`).
     pub orientation: u16,
+    /// User-applied quarter-turns clockwise (0–3, persisted) stacked on top
+    /// of `orientation`; lets a manual rotate fix missing or wrong EXIF.
+    pub rot_cw: u8,
     /// Cache path of the downscaled thumbnail JPEG; `None` until ingest
     /// succeeds or for rows whose extraction failed.
     pub thumb_path: Option<PathBuf>,
@@ -169,25 +172,43 @@ pub struct PhotoEntry {
 }
 
 impl PhotoEntry {
-    /// Aspect ratio (width / height) to lay out this photo with: the stored
-    /// preview size rotated by the EXIF orientation flag. Falls back to the
-    /// common 3:2 landscape default while the row is still pending.
+    /// Pixel size after every display rotation is applied: the stored
+    /// preview size transposed whenever the effective transform swaps axes
+    /// (EXIF orientations 5..=8 and odd user quarter-turns each flip it,
+    /// but two flips cancel out).
     ///
-    /// Orientations 5..=8 are the 90° swaps, so they transpose the ratio;
-    /// mirrored variants keep the same silhouette as their base value.
+    /// `None` while the row has no measured pixels yet. This — not
+    /// [`PhotoEntry::pixels`] — is what layout and pixel-parity zoom must
+    /// use; the texture pipeline rotates decoded JPEGs by this same rule.
+    pub fn display_pixels(&self) -> Option<(u32, u32)> {
+        let (width, height) = self.pixels?;
+        Some(if self.swaps_display_axes() {
+            (height, width)
+        } else {
+            (width, height)
+        })
+    }
+
+    /// Aspect ratio (width / height) to lay out this photo with: the
+    /// display-pixel silhouette after EXIF orientation and user turns.
+    /// Falls back to the common 3:2 landscape default while pending.
     pub fn display_aspect(&self) -> f32 {
-        let Some((width, height)) = self.pixels else {
+        let Some((width, height)) = self.display_pixels() else {
             return DEFAULT_ASPECT;
         };
         if width == 0 || height == 0 {
             return DEFAULT_ASPECT;
         }
-        let raw = width as f32 / height as f32;
-        if (5..=8).contains(&self.orientation) {
-            1.0 / raw
-        } else {
-            raw
-        }
+        width as f32 / height as f32
+    }
+
+    /// Whether the combined EXIF + user transform transposes width/height.
+    /// Mirrored orientations keep the same silhouette as their base value,
+    /// so only the 90°-swap families matter here.
+    fn swaps_display_axes(&self) -> bool {
+        let exif_swaps = (5..=8).contains(&self.orientation);
+        let turns_swap = self.rot_cw % 2 == 1;
+        exif_swaps ^ turns_swap
     }
 }
 
@@ -214,6 +235,8 @@ pub struct PhotoDetail {
     pub pixels: Option<(u32, u32)>,
     /// EXIF orientation flag (`1..8`); defaults to upright (`1`).
     pub orientation: u16,
+    /// User-applied quarter-turns clockwise (0–3, persisted).
+    pub rot_cw: u8,
     /// Cache path of the full-size preview JPEG; `None` until ingest
     /// succeeds or for rows whose extraction failed.
     pub preview_path: Option<PathBuf>,
@@ -296,6 +319,7 @@ mod tests {
             status: PhotoStatus::Pending,
             pixels: None,
             orientation: 1,
+            rot_cw: 0,
             thumb_path: None,
             err_msg: None,
         };
@@ -304,20 +328,58 @@ mod tests {
 
     #[test]
     fn display_aspect_should_rotate_for_quarter_turn_orientations() {
-        let make = |orientation: u16| PhotoEntry {
+        let make = |orientation: u16, rot_cw: u8| PhotoEntry {
             id: PhotoId(1),
             rel_path: "a.nef".into(),
             label: Label::None,
             status: PhotoStatus::Ok,
             pixels: Some((6000, 4000)),
             orientation,
+            rot_cw,
             thumb_path: None,
             err_msg: None,
         };
-        assert!((make(1).display_aspect() - 1.5).abs() < 0.01);
-        assert!((make(3).display_aspect() - 1.5).abs() < 0.01);
-        assert!((make(6).display_aspect() - 2.0 / 3.0).abs() < 0.01);
-        assert!((make(8).display_aspect() - 2.0 / 3.0).abs() < 0.01);
+        assert!((make(1, 0).display_aspect() - 1.5).abs() < 0.01);
+        assert!((make(3, 0).display_aspect() - 1.5).abs() < 0.01);
+        assert!((make(6, 0).display_aspect() - 2.0 / 3.0).abs() < 0.01);
+        assert!((make(8, 0).display_aspect() - 2.0 / 3.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn user_quarter_turns_should_swap_the_display_silhouette_only_when_odd() {
+        let make = |rot_cw: u8| PhotoEntry {
+            id: PhotoId(1),
+            rel_path: "a.nef".into(),
+            label: Label::None,
+            status: PhotoStatus::Ok,
+            pixels: Some((6000, 4000)),
+            orientation: 1,
+            rot_cw,
+            thumb_path: None,
+            err_msg: None,
+        };
+        assert_eq!(make(0).display_pixels(), Some((6000, 4000)));
+        assert_eq!(make(1).display_pixels(), Some((4000, 6000)));
+        // A half turn keeps the silhouette; three turns swap it again.
+        assert_eq!(make(2).display_pixels(), Some((6000, 4000)));
+        assert_eq!(make(3).display_pixels(), Some((4000, 6000)));
+    }
+
+    #[test]
+    fn exif_swaps_and_odd_user_turns_should_cancel_out() {
+        let entry = PhotoEntry {
+            id: PhotoId(1),
+            rel_path: "a.nef".into(),
+            label: Label::None,
+            status: PhotoStatus::Ok,
+            pixels: Some((6000, 4000)),
+            orientation: 6,
+            rot_cw: 3,
+            thumb_path: None,
+            err_msg: None,
+        };
+        // Portrait EXIF rotated once more CCW lands back on landscape.
+        assert_eq!(entry.display_pixels(), Some((6000, 4000)));
     }
 
     #[test]

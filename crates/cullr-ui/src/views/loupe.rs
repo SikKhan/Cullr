@@ -19,10 +19,9 @@ use cullr_core::PhotoDetail;
 use cullr_core::PhotoEntry;
 use cullr_core::PhotoStatus;
 
-use crate::tex::TexKey;
-use crate::tex::TextureState;
-use crate::tex::Textures;
+use crate::tex::{TexKey, TextureState, Textures};
 use crate::theme;
+use crate::views::grid::row_rotation;
 use crate::views::widgets;
 
 /// Zoom multiplier at fit-to-window; all zooming lives in `[1, max]`.
@@ -126,6 +125,11 @@ impl LoupeView {
         if !suspended && let Some(label) = widgets::pressed_label_key(ui.ctx()) {
             self.apply_label(entries, order, db, label, *auto_advance);
         }
+        // `[` / `]` turn the photo on display a quarter step; the change
+        // persists and re-decodes its texture next frame (SPEC §6).
+        if !suspended && let Some(direction) = widgets::pressed_rotate_key(ui.ctx()) {
+            self.rotate_current(entries, order, db, direction);
+        }
 
         let row = order[self.index];
         let entry = &entries[row];
@@ -147,7 +151,8 @@ impl LoupeView {
             }
             let path = fetch_detail(db, neighbor.id).and_then(|detail| detail.preview_path);
             let key = TexKey::screen(neighbor.id);
-            textures.prefetch([(key, path.as_deref())].into_iter());
+            let rotation = row_rotation(neighbor);
+            textures.prefetch([(key, path.as_deref().map(|path| (path, rotation)))].into_iter());
         }
 
         let (area, response) =
@@ -266,6 +271,32 @@ impl LoupeView {
         }
     }
 
+    /// Persists a quarter-turn for the photo on display and mirrors it
+    /// into the sheet's row. Zoom resets to fit because the silhouette
+    /// may swap between landscape and portrait; the texture re-decodes
+    /// automatically since the demanded rotation no longer matches the
+    /// resident slot.
+    fn rotate_current(
+        &mut self,
+        entries: &mut [PhotoEntry],
+        order: &[usize],
+        db: &Db,
+        direction: widgets::RotateDir,
+    ) {
+        let Some(&row) = order.get(self.index) else {
+            return;
+        };
+        let Some(entry) = entries.get_mut(row) else {
+            return;
+        };
+        entry.rot_cw = widgets::turned(entry.rot_cw, direction.delta());
+        if let Err(error) = db.set_rotation(entry.id, entry.rot_cw) {
+            tracing::warn!(%error, id = entry.id.0, "cannot persist rotation");
+        }
+        self.zoom = FIT_ZOOM;
+        self.pan = egui::Vec2::ZERO;
+    }
+
     /// Jumps to `index` and recenters: every photo starts at fit.
     fn move_to(&mut self, index: usize) {
         self.index = index;
@@ -300,25 +331,19 @@ fn neighbor_indices(index: usize, len: usize, reach: usize) -> impl Iterator<Ite
         .filter(move |&position| position < len)
 }
 
-/// Aspect of the stored preview pixels (unrotated, matching what was
-/// decoded into the texture).
+/// Aspect of the photo as displayed: preview pixels transposed by the
+/// EXIF orientation and user turns, exactly what the texture pipeline
+/// rotates the decoded JPEG into.
 fn image_aspect(entry: &PhotoEntry) -> f32 {
-    entry
-        .pixels
-        .and_then(|(width, height)| {
-            if width == 0 || height == 0 {
-                None
-            } else {
-                Some(width as f32 / height as f32)
-            }
-        })
-        .unwrap_or(cullr_core::DEFAULT_ASPECT)
+    entry.display_aspect()
 }
 
-/// Zoom multiplier that makes the image pixel-parity (100%) in the
-/// viewport; at least [`FIT_ZOOM`] so small previews stay put.
+/// Zoom multiplier that makes the displayed image pixel-parity (100%) in
+/// the viewport; at least [`FIT_ZOOM`] so small previews stay put. Uses
+/// display pixels — a rotated portrait's parity width is its stored
+/// height, matching what the texture actually shows.
 fn max_zoom(entry: &PhotoEntry, fitted_size: egui::Vec2) -> f32 {
-    let Some((width, _)) = entry.pixels else {
+    let Some((width, _)) = entry.display_pixels() else {
         return FIT_ZOOM;
     };
     if fitted_size.x <= 0.0 {
@@ -388,16 +413,20 @@ fn paint_photo(
     painter.rect_filled(area, 0.0, theme::BG);
     let center = area.center() + pan;
     match entry.status {
-        PhotoStatus::Ok => match textures.handle(TexKey::screen(entry.id), preview_path) {
-            TextureState::Ready(handle) => {
-                let displayed = super::grid::fit_rect(area, aspect).size() * zoom;
-                let destination = egui::Rect::from_center_size(center, displayed);
-                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-                painter.image(handle.id(), destination, uv, egui::Color32::WHITE);
+        PhotoStatus::Ok => {
+            match textures.handle(TexKey::screen(entry.id), preview_path, row_rotation(entry)) {
+                TextureState::Ready(handle) => {
+                    let displayed = super::grid::fit_rect(area, aspect).size() * zoom;
+                    let destination = egui::Rect::from_center_size(center, displayed);
+                    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                    painter.image(handle.id(), destination, uv, egui::Color32::WHITE);
+                }
+                TextureState::Loading => draw_shimmer(&painter, area, ui.input(|input| input.time)),
+                TextureState::Broken => {
+                    draw_warning(&painter, area, "Preview could not be decoded")
+                }
             }
-            TextureState::Loading => draw_shimmer(&painter, area, ui.input(|input| input.time)),
-            TextureState::Broken => draw_warning(&painter, area, "Preview could not be decoded"),
-        },
+        }
         PhotoStatus::Pending => {
             let spinner = egui::Spinner::new().size(28.0);
             ui.put(
@@ -737,11 +766,31 @@ mod tests {
             status: PhotoStatus::Ok,
             pixels: Some((3000, 2000)),
             orientation: 1,
+            rot_cw: 0,
             thumb_path: None,
             err_msg: None,
         };
         // Fit rect is 1500 px wide: 100% needs exactly 2×.
         assert!((max_zoom(&entry, egui::vec2(1500.0, 1000.0)) - 2.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn max_zoom_should_use_the_rotated_width_for_portrait_previews() {
+        let entry = PhotoEntry {
+            id: cullr_core::PhotoId(1),
+            rel_path: "a.nef".into(),
+            label: cullr_core::Label::None,
+            status: PhotoStatus::Ok,
+            pixels: Some((6000, 4000)),
+            orientation: 6,
+            rot_cw: 0,
+            thumb_path: None,
+            err_msg: None,
+        };
+        // Displayed portrait at fit width 1333 px: parity needs the
+        // stored height (4000), not the stored width.
+        let expected = 4000.0 / 1333.0;
+        assert!((max_zoom(&entry, egui::vec2(1333.0, 2000.0)) - expected).abs() < 1e-3);
     }
 
     #[test]
@@ -753,6 +802,7 @@ mod tests {
             status: PhotoStatus::Pending,
             pixels: None,
             orientation: 1,
+            rot_cw: 0,
             thumb_path: None,
             err_msg: None,
         };
@@ -767,6 +817,7 @@ mod tests {
             status: PhotoStatus::Ok,
             pixels: Some((6000, 4000)),
             orientation: 1,
+            rot_cw: 0,
             preview_path: None,
             thumb_path: None,
             camera: None,
@@ -790,6 +841,7 @@ mod tests {
             status: PhotoStatus::Ok,
             pixels: Some((6000, 4000)),
             orientation: 1,
+            rot_cw: 0,
             thumb_path: None,
             err_msg: None,
         }

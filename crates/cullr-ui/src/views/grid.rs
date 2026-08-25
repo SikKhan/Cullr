@@ -50,8 +50,13 @@ use super::widgets::CHIP_HEIGHT;
 use super::widgets::FilterChip;
 use super::widgets::LabelFilter;
 use super::widgets::SortKey;
-use crate::tex::{TexKey, TextureState, Textures};
+use crate::tex::{Rotation, TexKey, TextureState, Textures};
 use crate::theme;
+
+/// Display transform for one row: EXIF orientation plus user quarter-turns.
+pub(crate) fn row_rotation(entry: &PhotoEntry) -> Rotation {
+    Rotation::new(entry.orientation, entry.rot_cw)
+}
 
 /// Default cell width; height derives from the default photo aspect.
 const CELL_DEFAULT_WIDTH: f32 = 232.0;
@@ -185,6 +190,17 @@ pub struct GridView {
     /// Full-screen preview state while the loupe is open; `None` shows
     /// the contact sheet (SPEC §6: Grid ⇄ Loupe).
     loupe: Option<loupe::LoupeView>,
+    /// Vertical scroll offset the sheet settled on after its last drawn
+    /// frame; diagnostics and headless scroll-behavior tests read this.
+    settled_scroll_y: f32,
+    /// Screen-space top of the sheet viewport on the last drawn frame;
+    /// lets headless tests detect any upward creep of the bars above it.
+    settled_viewport_top: f32,
+    /// Top-of-sheet scroll queued for the next drawn frame. egui persists
+    /// ScrollArea offsets across sessions and folders, so every fresh
+    /// mount forces one frame back to the top instead of inheriting
+    /// wherever an earlier session left off.
+    reset_scroll: bool,
 }
 
 impl GridView {
@@ -217,6 +233,9 @@ impl GridView {
             cell_width: CELL_DEFAULT_WIDTH,
             open_requested: None,
             loupe: None,
+            settled_scroll_y: 0.0,
+            settled_viewport_top: 0.0,
+            reset_scroll: true,
         }
     }
 
@@ -241,6 +260,9 @@ impl GridView {
                 // Keys must work before any click, so the cursor arms on
                 // the first tile as soon as the folder resolves.
                 self.cursor = (!self.view.is_empty()).then_some(0);
+                // A fresh scan re-mounts the sheet: never resume from a
+                // scroll position left over by egui persistence.
+                self.reset_scroll = true;
             }
             Err(message) => self.error = Some(message),
         }
@@ -380,6 +402,9 @@ impl GridView {
             if let Some(label) = widgets::pressed_label_key(ui.ctx()) {
                 self.apply_label(db, label);
             }
+            if let Some(direction) = widgets::pressed_rotate_key(ui.ctx()) {
+                self.apply_rotation(db, direction);
+            }
             if let Some(cursor) = self.cursor
                 && let Some(next) =
                     nav.and_then(|key| stepped_cursor(cursor, key, columns, self.view.len()))
@@ -507,37 +532,48 @@ impl GridView {
     /// Filter bar row: chips with live per-label counts on the left; the
     /// zoom slider (SPEC §6) and sort pill on the right. Clicks and drags
     /// refilter / resize / reorder immediately.
+    ///
+    /// Both halves share one horizontal row, exactly like the top bar:
+    /// the right-aligned section must nest *inside* it. Placed directly
+    /// in the panel's vertical flow instead, its `ui.separator()` would
+    /// span the full available height — which for a content-sized panel
+    /// is the panel's own last-frame height — ratcheting the bar a few
+    /// pixels taller every frame and sliding the whole sheet down.
     fn filter_bar(&mut self, ui: &mut egui::Ui, tally: &Tally) {
         ui.add_space(3.0);
-        let picked = widgets::filter_chips(ui, self.filter, &tally.counts);
-        match picked {
-            Some(FilterChip::All) => {
-                self.filter.clear();
-                self.apply_order_change();
+        ui.horizontal(|ui| {
+            let picked = widgets::filter_chips(ui, self.filter, &tally.counts);
+            match picked {
+                Some(FilterChip::All) => {
+                    self.filter.clear();
+                    self.apply_order_change();
+                }
+                Some(FilterChip::Label(label)) => {
+                    self.filter.toggle(label);
+                    self.apply_order_change();
+                }
+                None => {}
             }
-            Some(FilterChip::Label(label)) => {
-                self.filter.toggle(label);
-                self.apply_order_change();
-            }
-            None => {}
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // The order swap is queued, not applied in place: applying it
-            // needs the db for the stamp cache, which only `ui` holds.
-            if let Some(sort) = widgets::sort_pill(ui, self.sort) {
-                self.pending_sort = Some(sort);
-            }
-            ui.separator();
-            ui.spacing_mut().interact_size.y = CHIP_HEIGHT;
-            let slider = egui::Slider::new(&mut self.cell_width, CELL_MIN_WIDTH..=CELL_MAX_WIDTH)
-                .show_value(false);
-            let cell = ui.add(slider);
-            let resized = cell.changed();
-            // `on_hover_text` consumes the response; read it first.
-            cell.on_hover_text("Cell size — Ctrl+wheel over the sheet also zooms");
-            if resized {
-                self.cell_width = CellGeom::new(self.cell_width).width;
-            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // The order swap is queued, not applied in place: applying
+                // it needs the db for the stamp cache, which only `ui`
+                // holds.
+                if let Some(sort) = widgets::sort_pill(ui, self.sort) {
+                    self.pending_sort = Some(sort);
+                }
+                ui.separator();
+                ui.spacing_mut().interact_size.y = CHIP_HEIGHT;
+                let slider =
+                    egui::Slider::new(&mut self.cell_width, CELL_MIN_WIDTH..=CELL_MAX_WIDTH)
+                        .show_value(false);
+                let cell = ui.add(slider);
+                let resized = cell.changed();
+                // `on_hover_text` consumes the response; read it first.
+                cell.on_hover_text("Cell size — Ctrl+wheel over the sheet also zooms");
+                if resized {
+                    self.cell_width = CellGeom::new(self.cell_width).width;
+                }
+            });
         });
         ui.add_space(3.0);
     }
@@ -869,6 +905,38 @@ impl GridView {
         }
     }
 
+    /// Rotates every selected photo a quarter turn (SPEC §6 keyboard map),
+    /// or the cursor's photo when nothing is selected — mirroring how
+    /// digits address the selection. Rows mirror instantly so tiles
+    /// re-render this frame; persistence lands as one transaction. The
+    /// texture cache re-decodes automatically because the requested
+    /// rotation no longer matches each tile's resident slot.
+    fn apply_rotation(&mut self, db: &cullr_core::Db, direction: widgets::RotateDir) {
+        let targets: Vec<usize> = if self.selection.is_empty() {
+            match self.cursor {
+                Some(cursor) if self.view.get(cursor).is_some() => vec![self.view[cursor]],
+                _ => return,
+            }
+        } else {
+            (0..self.entries.len())
+                .filter(|&row| self.selection.contains(&self.entries[row].id))
+                .collect()
+        };
+        let updates: Vec<(cullr_core::PhotoId, u8)> = targets
+            .iter()
+            .filter_map(|&row| {
+                let entry = self.entries.get_mut(row)?;
+                entry.rot_cw = widgets::turned(entry.rot_cw, direction.delta());
+                Some((entry.id, entry.rot_cw))
+            })
+            .collect();
+        if !updates.is_empty()
+            && let Err(error) = db.set_rotations(&updates)
+        {
+            tracing::warn!(%error, photos = updates.len(), "cannot persist rotation");
+        }
+    }
+
     /// Advances the rubber-band state machine one frame (SPEC §6 drag
     /// marquee). A press inside the sheet viewport arms a candidate;
     /// travel past [`MARQUEE_MIN_DRAG`] makes it live and every frame it
@@ -1030,14 +1098,21 @@ impl GridView {
 
         // One-shot scroll-into-view after arrow/auto-advance/refilter
         // moves: egui 0.36 has no request-a-row API, so the pixel offset
-        // of the target row is computed and applied exactly once.
-        let mut scroll = egui::ScrollArea::vertical().auto_shrink(false);
+        // of the target row is computed and applied exactly once. The
+        // salt keeps this sheet's persisted state separate from every
+        // other ScrollArea in the app (they share egui's default id).
+        let mut scroll = egui::ScrollArea::vertical()
+            .auto_shrink(false)
+            .id_salt("cullr_contact_sheet");
         if let Some(row) = self.scroll_target.take() {
             let content_height = total_rows.max(1) as f32 * geom.stride_y() + GAP;
             let centered =
                 row as f32 * geom.stride_y() + geom.height / 2.0 - ui.available_height() / 2.0;
             scroll = scroll.vertical_scroll_offset(centered.clamp(0.0, content_height));
+        } else if self.reset_scroll {
+            scroll = scroll.vertical_scroll_offset(0.0);
         }
+        self.reset_scroll = false;
         let output = scroll.show_rows(ui, geom.height, total_rows, |ui, rows| {
             rows_shown = rows.clone();
             for row in rows {
@@ -1079,6 +1154,8 @@ impl GridView {
         // The on-screen viewport, excluding scroll bars: presses outside
         // it (bars, chips) must not start a marquee.
         let viewport = output.inner_rect;
+        self.settled_scroll_y = output.state.offset.y;
+        self.settled_viewport_top = viewport.top();
 
         // Row-major traversal is already sorted; `focus` relies on that.
         visible_keys.sort_unstable();
@@ -1160,7 +1237,15 @@ impl GridView {
             .filter_map(|cell| self.view.get(cell))
             .filter_map(|&entry_row| self.entries.get(entry_row))
             .filter(|entry| entry.status == PhotoStatus::Ok)
-            .map(|entry| (TexKey::thumb(entry.id), entry.thumb_path.as_deref()));
+            .map(|entry| {
+                (
+                    TexKey::thumb(entry.id),
+                    entry
+                        .thumb_path
+                        .as_deref()
+                        .map(|path| (path, row_rotation(entry))),
+                )
+            });
         textures.prefetch(band);
     }
 }
@@ -1302,7 +1387,11 @@ fn draw_image_area(
     let painter = ui.painter();
     match entry.status {
         PhotoStatus::Ok => {
-            match textures.handle(TexKey::thumb(entry.id), entry.thumb_path.as_deref()) {
+            match textures.handle(
+                TexKey::thumb(entry.id),
+                entry.thumb_path.as_deref(),
+                row_rotation(entry),
+            ) {
                 TextureState::Ready(handle) => {
                     let fitted = fit_rect(area, entry.display_aspect());
                     let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
@@ -1689,6 +1778,7 @@ mod tests {
             status: PhotoStatus::Ok,
             pixels: Some((6000, 4000)),
             orientation: 1,
+            rot_cw: 0,
             thumb_path: None,
             err_msg: None,
         }
@@ -2047,6 +2137,45 @@ mod tests {
         assert_eq!(grid.cursor, Some(1));
     }
 
+    // --- manual rotation (SPEC §6 keyboard map) ---
+
+    #[test]
+    fn rotation_should_fall_back_to_the_cursor_photo_and_persist() {
+        let (_dir, db) = db_for_tests();
+        let mut grid = grid_with_db(&[TestLabel::None, TestLabel::None], &db);
+        grid.cursor = Some(0);
+
+        grid.apply_rotation(&db, widgets::RotateDir::Clockwise);
+        grid.apply_rotation(&db, widgets::RotateDir::CounterClockwise);
+
+        assert_eq!(grid.entries[0].rot_cw, 0, "CW then CCW returns upright");
+        assert_eq!(grid.entries[1].rot_cw, 0);
+        let stored = db
+            .photo_entry(grid.entries[0].id)
+            .expect("read")
+            .expect("row");
+        assert_eq!(stored.rot_cw, 0);
+    }
+
+    #[test]
+    fn rotation_should_batch_turn_every_selected_photo() {
+        let (_dir, db) = db_for_tests();
+        let mut grid = grid_with_db(&[TestLabel::None, TestLabel::None], &db);
+        grid.select_all();
+        grid.entries[1].rot_cw = 3;
+
+        grid.apply_rotation(&db, widgets::RotateDir::Clockwise);
+
+        // Each photo advances from its own current turn count.
+        assert_eq!(grid.entries[0].rot_cw, 1);
+        assert_eq!(grid.entries[1].rot_cw, 0);
+        let stored = db
+            .photo_entry(grid.entries[1].id)
+            .expect("read")
+            .expect("row");
+        assert_eq!(stored.rot_cw, 0);
+    }
+
     #[test]
     fn stats_line_should_count_the_selection_while_present() {
         let mut grid = grid_with(&[TestLabel::None, TestLabel::None]);
@@ -2156,6 +2285,209 @@ mod tests {
         assert_eq!(
             grid.view[loupe_position], 3,
             "…and lands on id 2's new slot (row 3)"
+        );
+    }
+
+    // --- headless scroll harness (launch + wheel behavior, SPEC §6) ---
+
+    const SHEET_FRAMES: f64 = 1.0 / 60.0;
+
+    /// Drives [`GridView`] through real egui passes with no renderer so
+    /// scroll behavior can be asserted end to end: wheel events in,
+    /// settled sheet offset and viewport position out.
+    struct Bench {
+        ctx: egui::Context,
+        db: Db,
+        _dir: TempDir,
+        textures: Textures,
+        time: f64,
+    }
+
+    struct Frame {
+        /// Sheet scroll offset after the frame settled.
+        offset_y: f32,
+        /// Screen-space top of the sheet viewport after the frame.
+        viewport_top: f32,
+    }
+
+    impl Bench {
+        fn new() -> Self {
+            let (_dir, db) = db_for_tests();
+            Self {
+                ctx: egui::Context::default(),
+                db,
+                _dir,
+                textures: Textures::new(),
+                time: 0.0,
+            }
+        }
+
+        fn step(&mut self, grid: &mut GridView, events: &[egui::Event]) -> Frame {
+            self.time += SHEET_FRAMES;
+            let ctx = &self.ctx;
+            let db = &self.db;
+            let textures = &mut self.textures;
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 800.0),
+                )),
+                time: Some(self.time),
+                events: events.to_vec(),
+                ..Default::default()
+            };
+            let mut full = ctx.run_ui(raw, |ui| {
+                textures.sync(ui.ctx());
+                grid.ui(ui, db, textures, false);
+            });
+            // Headless run: there is no renderer to upload deltas to.
+            full.textures_delta.clear();
+            Frame {
+                offset_y: grid.settled_scroll_y,
+                viewport_top: grid.settled_viewport_top,
+            }
+        }
+
+        /// `count` frames with no input at all.
+        fn idle(&mut self, grid: &mut GridView, count: usize) -> Vec<Frame> {
+            (0..count).map(|_| self.step(grid, &[])).collect()
+        }
+    }
+
+    /// One mouse-wheel notch upward (toward the sheet's top), as winit
+    /// reports a LineDelta notch on Linux.
+    fn wheel_up() -> egui::Event {
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, 1.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
+    /// One mouse-wheel notch downward.
+    fn wheel_down() -> egui::Event {
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, -1.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
+    fn pointer_over_sheet() -> egui::Event {
+        egui::Event::PointerMoved(egui::pos2(640.0, 400.0))
+    }
+
+    fn scanned_grid(count: usize, first_id: u64) -> GridView {
+        let entries: Vec<PhotoEntry> = (0..count)
+            .map(|index| entry_at(first_id + index as u64, TestLabel::None))
+            .collect();
+        let mut grid = GridView::new("/photos".into(), false);
+        grid.apply_scan(Ok(entries));
+        grid
+    }
+
+    /// The reported launch bug: the sheet slid down a little on open and
+    /// could never be scrolled back — the filter bar's right-aligned
+    /// separator claimed the panel's own height each frame, growing the
+    /// bar ~360 px/s until the sheet slid out from under the pointer and
+    /// blank space filled the view.
+    #[test]
+    fn sheet_should_hold_its_position_across_idle_frames_and_wheel_up() {
+        let mut bench = Bench::new();
+        let mut grid = scanned_grid(2000, 1);
+
+        bench.step(&mut grid, &[pointer_over_sheet()]);
+        let frames = bench.idle(&mut grid, 120);
+
+        for frame in &frames {
+            assert_eq!(frame.offset_y, 0.0, "an idle sheet must not move");
+            assert!(
+                frame.viewport_top < 200.0,
+                "the bars above the sheet must not grow: top {}",
+                frame.viewport_top
+            );
+        }
+        assert_eq!(
+            frames.last().expect("idle frames").viewport_top,
+            frames.first().expect("idle frames").viewport_top,
+            "the viewport top must be stable, not creeping"
+        );
+
+        // Wheel up hard at the top: nothing to see above row zero, but it
+        // must never push content down either.
+        for _ in 0..30 {
+            let frame = bench.step(&mut grid, &[wheel_up()]);
+            assert_eq!(frame.offset_y, 0.0);
+        }
+    }
+
+    #[test]
+    fn wheel_scrolling_should_move_the_sheet_both_ways() {
+        let mut bench = Bench::new();
+        let mut grid = scanned_grid(2000, 1);
+        bench.step(&mut grid, &[pointer_over_sheet()]);
+        bench.idle(&mut grid, 5);
+
+        for _ in 0..20 {
+            bench.step(&mut grid, &[wheel_down()]);
+        }
+        let descended = bench.step(&mut grid, &[]);
+        assert!(
+            descended.offset_y > 300.0,
+            "wheel-down must descend, got {}",
+            descended.offset_y
+        );
+
+        // Wheel-up must climb back toward the top, not stall or invert.
+        // The wheel notch is smoothed over later frames, so let the
+        // downward residue drain before judging the upward strokes.
+        bench.idle(&mut grid, 45);
+        let mut last = bench.step(&mut grid, &[]).offset_y;
+        for _ in 0..60 {
+            let frame = bench.step(&mut grid, &[wheel_up()]);
+            assert!(
+                frame.offset_y < last + f32::EPSILON,
+                "wheel-up went down: {} -> {}",
+                last,
+                frame.offset_y
+            );
+            last = frame.offset_y;
+        }
+        assert_eq!(
+            bench.step(&mut grid, &[]).offset_y,
+            0.0,
+            "enough wheel-up must reach the top"
+        );
+    }
+
+    /// egui persists ScrollArea offsets across folders and sessions; a
+    /// freshly opened folder must mount at its top regardless of where
+    /// the previous one was left.
+    #[test]
+    fn reopening_a_folder_should_mount_the_sheet_at_the_top() {
+        let mut bench = Bench::new();
+        let mut big = scanned_grid(2000, 1);
+        bench.step(&mut big, &[pointer_over_sheet()]);
+        for _ in 0..25 {
+            bench.step(&mut big, &[wheel_down()]);
+        }
+        let deep = bench.step(&mut big, &[]);
+        assert!(deep.offset_y > 100.0, "precondition: scrolled down");
+
+        // Real folder openings take a moment; that drains the wheel
+        // smoothing tail before the next sheet mounts.
+        bench.idle(&mut big, 45);
+
+        // A different folder opens (fresh GridView, same persistent egui
+        // state, exactly like a restart or a folder switch).
+        let mut small = scanned_grid(24, 10_000);
+        bench.step(&mut small, &[pointer_over_sheet()]);
+        let mounted = bench.step(&mut small, &[]);
+        assert_eq!(
+            mounted.offset_y, 0.0,
+            "a fresh folder must not inherit the old scroll"
         );
     }
 }

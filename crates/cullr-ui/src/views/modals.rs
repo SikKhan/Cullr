@@ -22,10 +22,11 @@ const PANEL_RADIUS: f32 = 10.0;
 const BACKDROP_DIM: egui::Color32 = egui::Color32::from_black_alpha(150);
 
 /// Keyboard shortcuts shown in the overlay, mirroring SPEC §6 exactly.
-const KEYBOARD_ROWS: [(&str, &str); 9] = [
+const KEYBOARD_ROWS: [(&str, &str); 10] = [
     ("← → ↑ ↓", "move the cursor"),
     ("1 … 5", "label red / yellow / green / blue / purple"),
     ("0", "clear the label"),
+    ("[ · ]", "rotate left / right (persisted)"),
     ("Tab", "toggle auto-advance after labeling"),
     ("Enter · Esc", "loupe ⇄ contact sheet"),
     ("Space", "loupe: fit ↔ 100% · sheet: open the loupe"),
@@ -378,9 +379,9 @@ mod tests {
 
     #[test]
     fn shortcut_tables_should_stay_in_sync_with_the_spec_shape() {
-        // SPEC §6 lists nine keyboard rows; the mouse table mirrors the
+        // SPEC §6 lists ten keyboard rows; the mouse table mirrors the
         // selection + zoom behaviors documented there.
-        assert_eq!(KEYBOARD_ROWS.len(), 9);
+        assert_eq!(KEYBOARD_ROWS.len(), 10);
         assert_eq!(MOUSE_ROWS.len(), 8);
         assert!(
             KEYBOARD_ROWS

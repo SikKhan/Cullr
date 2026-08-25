@@ -66,7 +66,8 @@ CREATE TABLE photos (
   mtime       INTEGER NOT NULL,
   size        INTEGER NOT NULL,
   width INTEGER, height INTEGER,
-  orientation INTEGER NOT NULL DEFAULT 1,
+  orientation INTEGER NOT NULL DEFAULT 1,     -- EXIF flag 1..8
+  rot_cw INTEGER NOT NULL DEFAULT 0,          -- user quarter-turns CW 0..3
   camera TEXT, lens TEXT,
   taken_at TEXT,
   shutter TEXT, aperture REAL, iso INTEGER, focal_mm REAL,
@@ -100,7 +101,9 @@ walkdir (depth 1 default, recursive opt-in) → extension filter = hardcoded lis
 Cancellation: generation counter bumped on folder switch; workers check between steps and drop results. Visible-window priority ping reorders queue so near-viewport items jump ahead.
 
 ### 5.3 Display textures
-`tex.rs`: LRU keyed `(PhotoId, SizeClass{Thumb, Screen})`, byte budget 512 MB. Miss → decode cached JPEG off-thread → RGBA8 via channel → `load_texture` next frame on UI thread. Uploads amortized ≤ 6 new textures/frame. Loupe prefetches id±3 neighbors.
+`tex.rs`: LRU keyed `(PhotoId, SizeClass{Thumb, Screen})`, byte budget 512 MB. Miss → decode cached JPEG off-thread, rotate upright (EXIF orientation + user `rot_cw` turns) → RGBA8 via channel → `load_texture` next frame on UI thread. Uploads amortized ≤ 6 new textures/frame. Loupe prefetches id±3 neighbors. A rotation change invalidates the resident slot like a new asset path does.
+
+Cached assets keep the sensor orientation they were embedded with; turning them upright is a presentation concern applied once per decode on the worker thread.
 
 ## 6. UI spec
 
@@ -118,6 +121,7 @@ Views: Home → Grid ⇄ Loupe. Top bar persists in Grid/Loupe.
 |---|---|
 | `←→↑↓` | move cursor |
 | `1..5` / `0` | label red/yellow/green/blue/purple / clear |
+| `[` / `]` | rotate 90° left / right (selection or cursor; loupe: current photo) — persisted |
 | `Tab` | toggle auto-advance-after-label (persisted) |
 | `Enter` / `Esc` | loupe ⇄ grid |
 | `Space` | loupe: fit/100% · grid: enter loupe |

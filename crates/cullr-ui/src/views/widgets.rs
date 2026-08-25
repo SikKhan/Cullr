@@ -359,6 +359,45 @@ pub fn tab_pressed(ctx: &egui::Context) -> bool {
     ctx.input(|input| input.key_pressed(egui::Key::Tab))
 }
 
+/// Direction of a manual display rotation (SPEC §6 keyboard map).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RotateDir {
+    /// `[`: quarter-turn counter-clockwise.
+    CounterClockwise,
+    /// `]`: quarter-turn clockwise.
+    Clockwise,
+}
+
+impl RotateDir {
+    /// Signed quarter-turn step to add to a photo's stored `rot_cw`.
+    pub fn delta(self) -> i8 {
+        match self {
+            Self::CounterClockwise => -1,
+            Self::Clockwise => 1,
+        }
+    }
+}
+
+/// The manual rotation key pressed this frame, if any. Works in whichever
+/// view is on screen: grid tiles (selection or cursor) and the loupe.
+pub fn pressed_rotate_key(ctx: &egui::Context) -> Option<RotateDir> {
+    ctx.input(|input| {
+        if input.key_pressed(egui::Key::OpenBracket) {
+            Some(RotateDir::CounterClockwise)
+        } else if input.key_pressed(egui::Key::CloseBracket) {
+            Some(RotateDir::Clockwise)
+        } else {
+            None
+        }
+    })
+}
+
+/// Wraps a quarter-turn count into `0..4` after applying `delta`; pure so
+/// both views share one wrap rule.
+pub fn turned(current: u8, delta: i8) -> u8 {
+    (i16::from(current % 4) + i16::from(delta)).rem_euclid(4) as u8
+}
+
 /// Loads the persisted auto-advance setting, defaulting to on: the tool's
 /// whole purpose is rapid sequential culling, and one Tab turns it off.
 /// Read failures degrade to the default rather than blocking startup.
@@ -599,5 +638,22 @@ mod tests {
     fn sort_key_should_name_both_orders_for_the_pill() {
         assert!(!SortKey::FileName.label().is_empty());
         assert!(!SortKey::TakenAt.label().is_empty());
+    }
+
+    #[test]
+    fn turned_should_wrap_quarter_turns_into_canonical_range() {
+        assert_eq!(turned(0, RotateDir::Clockwise.delta()), 1);
+        assert_eq!(turned(3, RotateDir::Clockwise.delta()), 0, "CW wraps");
+        assert_eq!(
+            turned(0, RotateDir::CounterClockwise.delta()),
+            3,
+            "CCW wraps"
+        );
+        // Repeated presses keep cycling without ever leaving 0..4.
+        let mut turns = 2;
+        for delta in [1, 1, -1, -1] {
+            turns = turned(turns, delta);
+        }
+        assert_eq!(turns, 2, "two CW then two CCW returns to start");
     }
 }

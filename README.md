@@ -18,6 +18,7 @@ Culling speed comes from embedded JPEG previews, never full RAW decode. The cont
 
 - Virtualized contact sheet: only visible cells own GPU textures (LRU cache, 512 MB budget)
 - Full-screen loupe: fit / 100% zoom toward cursor, drag to pan, neighbor prefetch
+- Portrait auto-detect: EXIF orientation applied on display; `[` / `]` rotate manually (persisted)
 - Color labels `1`–`5` / `0` (red, yellow, green, blue, purple / clear), persisted instantly
 - Auto-advance after labeling (`Tab` toggle, persisted)
 - Filter chips with live per-label counts; `F` cycles All → Labeled → Unlabeled presets
@@ -59,6 +60,7 @@ Linux-first (X11 and Wayland verified), portable anywhere Rust builds. No system
 |---|---|
 | `←→↑↓` | move cursor |
 | `1..5` / `0` | label red/yellow/green/blue/purple / clear |
+| `[` / `]` | rotate 90° left / right (persisted) |
 | `Tab` | toggle auto-advance-after-label (persisted) |
 | `Enter` / `Esc` | loupe ⇄ grid |
 | `Space` | loupe: fit/100% · grid: enter loupe |

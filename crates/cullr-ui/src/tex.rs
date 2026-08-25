@@ -1,7 +1,8 @@
 //! GPU texture pipeline for grid/loupe imagery (SPEC §5.3).
 //!
-//! Cached thumbnail JPEGs are decoded on small worker threads and uploaded
-//! to the GPU here, on the UI thread, at a capped rate per frame. Live
+//! Cached thumbnail JPEGs are decoded on small worker threads — turned
+//! upright per their EXIF flag and any user rotation — and uploaded to
+//! the GPU here, on the UI thread, at a capped rate per frame. Live
 //! textures form an LRU keyed by photo id with a byte budget, so only
 //! recently seen cells own GPU memory (SPEC key invariant) and scrolling a
 //! huge folder cannot exhaust VRAM.
@@ -32,6 +33,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 use eframe::egui;
+use image::DynamicImage;
 
 use cullr_core::PhotoId;
 
@@ -60,6 +62,74 @@ pub enum TextureState {
     /// The cached JPEG exists but could not be decoded; draw a fallback
     /// instead of retrying forever.
     Broken,
+}
+
+/// Display rotation applied when a cached JPEG is decoded: the photo's
+/// EXIF orientation flag plus any user quarter-turns clockwise on top.
+///
+/// Cached assets keep the sensor orientation they were embedded with;
+/// turning them upright is a presentation concern, so it happens here —
+/// once per decode, off the UI thread. Changing either field invalidates
+/// the resident slot exactly like a re-ingested asset path does, which is
+/// what makes manual rotation refresh tiles without cache surgery.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Rotation {
+    /// EXIF orientation flag (`1..8`, TIFF spec); values outside the range
+    /// decode as upright.
+    pub exif: u16,
+    /// Extra quarter-turns clockwise (`0..4`).
+    pub cw_turns: u8,
+}
+
+impl Rotation {
+    /// No rotation at all.
+    pub const UPRIGHT: Self = Self {
+        exif: 1,
+        cw_turns: 0,
+    };
+
+    /// Builds the transform for one photo row.
+    pub fn new(exif: u16, cw_turns: u8) -> Self {
+        Self {
+            exif,
+            cw_turns: cw_turns % 4,
+        }
+    }
+}
+
+impl Default for Rotation {
+    fn default() -> Self {
+        Self::UPRIGHT
+    }
+}
+
+/// Turns a stored-orientation image into display pixels: first the EXIF
+/// correction (mirrors and quarter-turns per the TIFF spec), then the
+/// user's clockwise turns. Pure so the mapping is unit-testable against
+/// known pixel matrices.
+fn orient_upright(mut image: DynamicImage, rotation: Rotation) -> DynamicImage {
+    match rotation.exif {
+        2 => image = image.fliph(),
+        3 => image = image.rotate180(),
+        4 => image = image.flipv(),
+        // 5 (transpose) and 7 (transverse): the two diagonal mirrors are a
+        // quarter turn composed with an edge flip.
+        5 => {
+            image = image.rotate90();
+            image = image.fliph();
+        }
+        6 => image = image.rotate90(),
+        7 => {
+            image = image.rotate90();
+            image = image.flipv();
+        }
+        8 => image = image.rotate270(),
+        _ => {}
+    }
+    for _ in 0..rotation.cw_turns.min(3) {
+        image = image.rotate90();
+    }
+    image
 }
 
 /// Which rendition of a photo a texture serves (SPEC §5.3 keys textures
@@ -145,6 +215,7 @@ impl Limits {
 struct Slot {
     handle: egui::TextureHandle,
     path: PathBuf,
+    rotation: Rotation,
     bytes: usize,
     last_used: u64,
 }
@@ -152,6 +223,7 @@ struct Slot {
 /// A dispatched-but-not-yet-uploaded decode request.
 struct Pending {
     path: PathBuf,
+    rotation: Rotation,
     /// Focus epoch the request was made in; workers skip jobs whose ticket
     /// no longer matches, and `focus` reaps entries older than one bump.
     ticket: u64,
@@ -160,12 +232,14 @@ struct Pending {
 struct Job {
     key: TexKey,
     path: PathBuf,
+    rotation: Rotation,
     ticket: u64,
 }
 
 struct Decoded {
     key: TexKey,
     path: PathBuf,
+    rotation: Rotation,
     image: Result<egui::ColorImage, String>,
 }
 
@@ -179,7 +253,7 @@ pub struct Textures {
     slots: HashMap<TexKey, Slot>,
     pending: HashMap<TexKey, Pending>,
     ready: VecDeque<Decoded>,
-    broken: HashMap<TexKey, PathBuf>,
+    broken: HashMap<TexKey, (PathBuf, Rotation)>,
     demand_tx: Sender<Job>,
     prefetch_tx: Sender<Job>,
     decoded_rx: Receiver<Decoded>,
@@ -238,36 +312,44 @@ impl Textures {
         }
     }
 
-    /// Texture for `key`'s image at `path`, requesting a decode on miss.
+    /// Texture for `key`'s image at `path`, displayed with `rotation`,
+    /// requesting a decode on miss.
     ///
     /// Returns [`TextureState::Ready`] once paintable; otherwise the caller
     /// draws a placeholder. Passing `None` (row not ingested yet) reports
     /// plain loading without touching any queue.
-    pub fn handle(&mut self, key: TexKey, path: Option<&Path>) -> TextureState {
+    pub fn handle(&mut self, key: TexKey, path: Option<&Path>, rotation: Rotation) -> TextureState {
         let Some(path) = path else {
             return TextureState::Loading;
         };
         if let Some(slot) = self.slots.get_mut(&key) {
-            if slot.path == path {
+            if slot.path == path && slot.rotation == rotation {
                 slot.last_used = self.frame;
                 return TextureState::Ready(slot.handle.clone());
             }
-            // Same row re-ingested from a new file version: its old pixels
-            // are wrong now, so forget them before re-keying below.
+            // Same row re-ingested from a new file version — or manually
+            // rotated: its old pixels are wrong now, so forget them before
+            // re-keying below.
             self.drop_slot(key);
         }
-        if self.broken.get(&key).is_some_and(|stale| *stale == path) {
+        if self
+            .broken
+            .get(&key)
+            .is_some_and(|stale| *stale == (path.to_owned(), rotation))
+        {
             return TextureState::Broken;
         }
         let ticket = self.epoch.load(Ordering::Relaxed);
         let needs_dispatch = match self.pending.get(&key) {
-            Some(pending) => pending.path != path || pending.ticket != ticket,
+            Some(pending) => {
+                pending.path != path || pending.rotation != rotation || pending.ticket != ticket
+            }
             // Ticket aged out of a focus bump while the id stayed visible:
             // its worker-side job will be skipped, so re-issue it.
             None => true,
         };
         if needs_dispatch {
-            self.dispatch(key, path.to_owned());
+            self.dispatch(key, path.to_owned(), rotation);
         }
         TextureState::Loading
     }
@@ -299,9 +381,12 @@ impl Textures {
     /// rows around the viewport and loupe id±3 alike. Skips anything
     /// already live, broken or queued, and pauses entirely while too many
     /// decodes are outstanding — visible demand always wins the workers.
-    pub fn prefetch<'p>(&mut self, requests: impl Iterator<Item = (TexKey, Option<&'p Path>)>) {
-        for (key, path) in requests {
-            let Some(path) = path else {
+    pub fn prefetch<'p>(
+        &mut self,
+        requests: impl Iterator<Item = (TexKey, Option<(&'p Path, Rotation)>)>,
+    ) {
+        for (key, request) in requests {
+            let Some((path, rotation)) = request else {
                 continue;
             };
             if self.slots.contains_key(&key)
@@ -309,7 +394,7 @@ impl Textures {
                 || self
                     .pending
                     .get(&key)
-                    .is_some_and(|pending| pending.path == path)
+                    .is_some_and(|pending| pending.path == path && pending.rotation == rotation)
             {
                 continue;
             }
@@ -323,12 +408,14 @@ impl Textures {
                 key,
                 Pending {
                     path: path.to_owned(),
+                    rotation,
                     ticket,
                 },
             );
             let _sent = self.prefetch_tx.send(Job {
                 key,
                 path: path.to_owned(),
+                rotation,
                 ticket,
             });
         }
@@ -339,13 +426,13 @@ impl Textures {
     pub fn sync(&mut self, ctx: &egui::Context) {
         self.frame += 1;
         while let Ok(decoded) = self.decoded_rx.try_recv() {
-            if self.pending.get(&decoded.key).map(|p| p.path.as_path())
-                == Some(decoded.path.as_path())
-            {
+            if self.pending.get(&decoded.key).is_some_and(|pending| {
+                pending.path == decoded.path && pending.rotation == decoded.rotation
+            }) {
                 self.ready.push_back(decoded);
             } else {
-                // Superseded request (epoch cancelled or path changed):
-                // dropped without reaching the GPU.
+                // Superseded request (epoch cancelled or path/rotation
+                // changed): dropped without reaching the GPU.
             }
         }
         // Bound the RAM backlog; shed the oldest (stalest) results first
@@ -355,7 +442,9 @@ impl Textures {
             let Some(shed) = self.ready.pop_front() else {
                 break;
             };
-            if self.pending.get(&shed.key).map(|p| p.path.as_path()) == Some(shed.path.as_path()) {
+            if self.pending.get(&shed.key).is_some_and(|pending| {
+                pending.path == shed.path && pending.rotation == shed.rotation
+            }) {
                 self.pending.remove(&shed.key);
             }
         }
@@ -363,17 +452,25 @@ impl Textures {
             let Some(decoded) = self.ready.pop_front() else {
                 break;
             };
-            if self.pending.get(&decoded.key).map(|p| p.path.as_path())
-                != Some(decoded.path.as_path())
-            {
+            let matches_pending = self.pending.get(&decoded.key).is_some_and(|pending| {
+                pending.path == decoded.path && pending.rotation == decoded.rotation
+            });
+            if !matches_pending {
+                // Superseded between backlog and upload: drop silently.
                 continue;
             }
             self.pending.remove(&decoded.key);
-            match decoded.image {
-                Ok(image) => self.upload(ctx, decoded.key, decoded.path, image),
+            let Decoded {
+                key,
+                path,
+                rotation,
+                image,
+            } = decoded;
+            match image {
+                Ok(image) => self.upload(ctx, key, path, rotation, image),
                 Err(error) => {
-                    tracing::debug!(id = decoded.key.id.0, %error, "image decode failed");
-                    self.broken.insert(decoded.key, decoded.path);
+                    tracing::debug!(id = key.id.0, %error, "image decode failed");
+                    self.broken.insert(key, (path, rotation));
                 }
             }
         }
@@ -405,19 +502,32 @@ impl Textures {
         self.broken.retain(|key, _| keep.contains(&key.id));
     }
 
-    fn dispatch(&mut self, key: TexKey, path: PathBuf) {
+    fn dispatch(&mut self, key: TexKey, path: PathBuf, rotation: Rotation) {
         let ticket = self.epoch.load(Ordering::Relaxed);
         self.pending.insert(
             key,
             Pending {
                 path: path.clone(),
+                rotation,
                 ticket,
             },
         );
-        let _sent = self.demand_tx.send(Job { key, path, ticket });
+        let _sent = self.demand_tx.send(Job {
+            key,
+            path,
+            rotation,
+            ticket,
+        });
     }
 
-    fn upload(&mut self, ctx: &egui::Context, key: TexKey, path: PathBuf, image: egui::ColorImage) {
+    fn upload(
+        &mut self,
+        ctx: &egui::Context,
+        key: TexKey,
+        path: PathBuf,
+        rotation: Rotation,
+        image: egui::ColorImage,
+    ) {
         let [width, height] = image.size;
         let bytes = width * height * 4;
         let name = format!("{}-{}", key.class_prefix(), key.id.0);
@@ -428,6 +538,7 @@ impl Textures {
             Slot {
                 handle,
                 path,
+                rotation,
                 bytes,
                 last_used: self.frame,
             },
@@ -492,8 +603,9 @@ struct Worker {
 }
 
 impl Worker {
-    /// Pull-loop: read → (skip if superseded) → decode → ship RGBA8 back
-    /// for UI-thread upload. Exits when the cache (and both senders) drop.
+    /// Pull-loop: read → (skip if superseded) → decode + rotate → ship
+    /// RGBA8 back for UI-thread upload. Exits when the cache (and both
+    /// senders) drop.
     fn run(&self) {
         while let Some(job) = self.next_job() {
             // Epoch mismatch means the user scrolled on: skip in O(1)
@@ -501,10 +613,15 @@ impl Worker {
             if self.epoch.load(Ordering::Relaxed) != job.ticket {
                 continue;
             }
-            let image = decode_jpeg(&job.path);
+            // Rotation happens here, off the UI thread, while the decoded
+            // buffer is already in memory; a portrait screen preview pays
+            // one extra buffer copy per open instead of every frame.
+            let image =
+                decode_jpeg(&job.path).map(|image| colorize(orient_upright(image, job.rotation)));
             let _sent = self.decoded.send(Decoded {
                 key: job.key,
                 path: job.path,
+                rotation: job.rotation,
                 image,
             });
         }
@@ -541,15 +658,19 @@ impl Worker {
     }
 }
 
-/// Decodes a cached thumbnail JPEG into an unmultiplied-RGBA image.
-fn decode_jpeg(path: &Path) -> Result<egui::ColorImage, String> {
+/// Decodes a cached thumbnail JPEG into its stored pixels.
+fn decode_jpeg(path: &Path) -> Result<DynamicImage, String> {
     let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
-    let image = image::load_from_memory(&bytes).map_err(|error| error.to_string())?;
+    image::load_from_memory(&bytes).map_err(|error| error.to_string())
+}
+
+/// Converts display-ready pixels into an unmultiplied-RGBA GPU image.
+fn colorize(image: DynamicImage) -> egui::ColorImage {
     let rgba = image.to_rgba8();
-    Ok(egui::ColorImage::from_rgba_unmultiplied(
+    egui::ColorImage::from_rgba_unmultiplied(
         [rgba.width() as usize, rgba.height() as usize],
         rgba.as_raw(),
-    ))
+    )
 }
 
 #[cfg(test)]
@@ -613,7 +734,11 @@ mod tests {
         let mut textures = textures_with(prod_limits());
 
         for (index, file) in files.iter().enumerate() {
-            textures.handle(TexKey::thumb(PhotoId(index as u64)), Some(file));
+            textures.handle(
+                TexKey::thumb(PhotoId(index as u64)),
+                Some(file),
+                Rotation::UPRIGHT,
+            );
         }
         let mut synced_frames = 0;
         let all_ready = env.settle(|| {
@@ -654,12 +779,12 @@ mod tests {
 
         // Load 1 and 2 sequentially so their recency stamps differ by
         // whole frames regardless of worker scheduling.
-        textures.handle(TexKey::thumb(PhotoId(1)), Some(&a));
+        textures.handle(TexKey::thumb(PhotoId(1)), Some(&a), Rotation::UPRIGHT);
         let _ = env.settle(|| {
             textures.sync(&env.ctx);
             textures.slots.contains_key(&TexKey::thumb(PhotoId(1)))
         });
-        textures.handle(TexKey::thumb(PhotoId(2)), Some(&b));
+        textures.handle(TexKey::thumb(PhotoId(2)), Some(&b), Rotation::UPRIGHT);
         let _ = env.settle(|| {
             textures.sync(&env.ctx);
             textures.slots.contains_key(&TexKey::thumb(PhotoId(2)))
@@ -668,8 +793,8 @@ mod tests {
         // recency than 2's upload frame (ties fall back to id order).
         textures.sync(&env.ctx);
         // Touch 1 well after 2's upload so its recency clearly wins.
-        textures.handle(TexKey::thumb(PhotoId(1)), Some(&a));
-        textures.handle(TexKey::thumb(PhotoId(3)), Some(&c));
+        textures.handle(TexKey::thumb(PhotoId(1)), Some(&a), Rotation::UPRIGHT);
+        textures.handle(TexKey::thumb(PhotoId(3)), Some(&c), Rotation::UPRIGHT);
         let settled = env.settle(|| {
             textures.sync(&env.ctx);
             !textures.busy()
@@ -705,7 +830,11 @@ mod tests {
             .collect();
         let mut textures = textures_with(limits);
         for (index, file) in files.iter().enumerate() {
-            textures.handle(TexKey::thumb(PhotoId(index as u64)), Some(file));
+            textures.handle(
+                TexKey::thumb(PhotoId(index as u64)),
+                Some(file),
+                Rotation::UPRIGHT,
+            );
         }
         // Highest id also wins recency ties, mirroring a cell that stays on
         // screen while everything around it scrolls past.
@@ -714,7 +843,11 @@ mod tests {
         let settled = env.settle(|| {
             // Re-demanding the hot key refreshes its recency every frame,
             // exactly like a visible cell repainted by the grid.
-            textures.handle(hot, Some(files.last().expect("non-empty").as_path()));
+            textures.handle(
+                hot,
+                Some(files.last().expect("non-empty").as_path()),
+                Rotation::UPRIGHT,
+            );
             textures.sync(&env.ctx);
             !textures.busy()
         });
@@ -742,7 +875,11 @@ mod tests {
             .collect();
         let mut textures = textures_with(limits);
         for (index, file) in files.iter().enumerate() {
-            textures.handle(TexKey::thumb(PhotoId(index as u64)), Some(file));
+            textures.handle(
+                TexKey::thumb(PhotoId(index as u64)),
+                Some(file),
+                Rotation::UPRIGHT,
+            );
         }
         let _ = env.settle(|| {
             textures.sync(&env.ctx);
@@ -772,8 +909,8 @@ mod tests {
         let kept = TexKey::thumb(PhotoId(1));
         let gone = TexKey::thumb(PhotoId(2));
 
-        textures.handle(kept, Some(&kept_file));
-        textures.handle(gone, Some(&gone_file));
+        textures.handle(kept, Some(&kept_file), Rotation::UPRIGHT);
+        textures.handle(gone, Some(&gone_file), Rotation::UPRIGHT);
         let _ = env.settle(|| {
             textures.sync(&env.ctx);
             textures.slots.len() == 2
@@ -807,8 +944,8 @@ mod tests {
         let mut textures = textures_with(prod_limits());
         let key = TexKey::thumb(PhotoId(6));
 
-        textures.handle(key, Some(&file));
-        textures.prefetch([(key, Some(file.as_path()))].into_iter());
+        textures.handle(key, Some(&file), Rotation::UPRIGHT);
+        textures.prefetch([(key, Some((file.as_path(), Rotation::UPRIGHT)))].into_iter());
 
         assert_eq!(
             textures.pending.len(),
@@ -818,9 +955,12 @@ mod tests {
 
         let _ = env.settle(|| {
             textures.sync(&env.ctx);
-            matches!(textures.handle(key, Some(&file)), TextureState::Ready(_))
+            matches!(
+                textures.handle(key, Some(&file), Rotation::UPRIGHT),
+                TextureState::Ready(_)
+            )
         });
-        textures.prefetch([(key, Some(file.as_path()))].into_iter());
+        textures.prefetch([(key, Some((file.as_path(), Rotation::UPRIGHT)))].into_iter());
 
         assert!(!textures.busy(), "prefetch requeued a resident texture");
     }
@@ -831,7 +971,7 @@ mod tests {
         let file = env.jpeg("cancel.jpg", 8, 6);
         let mut textures = textures_with(prod_limits());
 
-        textures.handle(TexKey::thumb(PhotoId(7)), Some(&file));
+        textures.handle(TexKey::thumb(PhotoId(7)), Some(&file), Rotation::UPRIGHT);
         // The user scrolls: id 7 leaves the viewport, another id shows up.
         textures.focus(&[TexKey::thumb(PhotoId(8))]);
         let drained = env.settle(|| {
@@ -843,11 +983,11 @@ mod tests {
         assert!(textures.slots.is_empty(), "cancelled work reached the GPU");
 
         // Scrolled back into view: a fresh demand re-loads it.
-        textures.handle(TexKey::thumb(PhotoId(7)), Some(&file));
+        textures.handle(TexKey::thumb(PhotoId(7)), Some(&file), Rotation::UPRIGHT);
         let loaded = env.settle(|| {
             textures.sync(&env.ctx);
             matches!(
-                textures.handle(TexKey::thumb(PhotoId(7)), Some(&file)),
+                textures.handle(TexKey::thumb(PhotoId(7)), Some(&file), Rotation::UPRIGHT),
                 TextureState::Ready(_)
             )
         });
@@ -868,7 +1008,11 @@ mod tests {
         let mut textures = textures_with(limits);
 
         for (index, file) in files.iter().enumerate() {
-            textures.handle(TexKey::thumb(PhotoId(index as u64)), Some(file));
+            textures.handle(
+                TexKey::thumb(PhotoId(index as u64)),
+                Some(file),
+                Rotation::UPRIGHT,
+            );
         }
         // Let both workers finish all eight sub-millisecond decodes before
         // the first sync, so the backlog overflows deterministically.
@@ -891,12 +1035,20 @@ mod tests {
         // Re-demanding the shed ids must recover every one of them.
         let all_recovered = env.settle(|| {
             for index in &missing {
-                textures.handle(TexKey::thumb(PhotoId(*index as u64)), Some(&files[*index]));
+                textures.handle(
+                    TexKey::thumb(PhotoId(*index as u64)),
+                    Some(&files[*index]),
+                    Rotation::UPRIGHT,
+                );
             }
             textures.sync(&env.ctx);
             missing.iter().all(|index| {
                 matches!(
-                    textures.handle(TexKey::thumb(PhotoId(*index as u64)), Some(&files[*index])),
+                    textures.handle(
+                        TexKey::thumb(PhotoId(*index as u64)),
+                        Some(&files[*index]),
+                        Rotation::UPRIGHT
+                    ),
                     TextureState::Ready(_)
                 )
             })
@@ -918,11 +1070,17 @@ mod tests {
         };
         let mut textures = textures_with(limits);
 
-        textures.handle(TexKey::thumb(PhotoId(1)), Some(&one));
+        textures.handle(TexKey::thumb(PhotoId(1)), Some(&one), Rotation::UPRIGHT);
         textures.prefetch(
             [
-                (TexKey::thumb(PhotoId(2)), Some(two.as_path())),
-                (TexKey::thumb(PhotoId(3)), Some(three.as_path())),
+                (
+                    TexKey::thumb(PhotoId(2)),
+                    Some((two.as_path(), Rotation::UPRIGHT)),
+                ),
+                (
+                    TexKey::thumb(PhotoId(3)),
+                    Some((three.as_path(), Rotation::UPRIGHT)),
+                ),
             ]
             .into_iter(),
         );
@@ -946,21 +1104,27 @@ mod tests {
         let id = PhotoId(5);
         let key = TexKey::thumb(id);
 
-        textures.handle(key, Some(&old));
+        textures.handle(key, Some(&old), Rotation::UPRIGHT);
         let loaded = env.settle(|| {
             textures.sync(&env.ctx);
-            matches!(textures.handle(key, Some(&old)), TextureState::Ready(_))
+            matches!(
+                textures.handle(key, Some(&old), Rotation::UPRIGHT),
+                TextureState::Ready(_)
+            )
         });
         assert!(loaded, "initial load failed");
 
-        textures.handle(key, Some(&new));
+        textures.handle(key, Some(&new), Rotation::UPRIGHT);
         assert!(matches!(
-            textures.handle(key, Some(&new)),
+            textures.handle(key, Some(&new), Rotation::UPRIGHT),
             TextureState::Loading
         ));
         let swapped = env.settle(|| {
             textures.sync(&env.ctx);
-            matches!(textures.handle(key, Some(&new)), TextureState::Ready(_))
+            matches!(
+                textures.handle(key, Some(&new), Rotation::UPRIGHT),
+                TextureState::Ready(_)
+            )
         });
 
         assert!(swapped, "re-ingested texture never became ready");
@@ -976,10 +1140,13 @@ mod tests {
         let id = PhotoId(9);
         let key = TexKey::thumb(id);
 
-        textures.handle(key, Some(&corrupt));
+        textures.handle(key, Some(&corrupt), Rotation::UPRIGHT);
         let marked = env.settle(|| {
             textures.sync(&env.ctx);
-            matches!(textures.handle(key, Some(&corrupt)), TextureState::Broken)
+            matches!(
+                textures.handle(key, Some(&corrupt), Rotation::UPRIGHT),
+                TextureState::Broken
+            )
         });
 
         assert!(marked, "decode failure never surfaced as Broken");
@@ -996,15 +1163,15 @@ mod tests {
         let thumb_key = TexKey::thumb(id);
         let screen_key = TexKey::screen(id);
 
-        textures.handle(thumb_key, Some(&thumb));
-        textures.handle(screen_key, Some(&screen));
+        textures.handle(thumb_key, Some(&thumb), Rotation::UPRIGHT);
+        textures.handle(screen_key, Some(&screen), Rotation::UPRIGHT);
         let both_ready = env.settle(|| {
             textures.sync(&env.ctx);
             matches!(
-                textures.handle(thumb_key, Some(&thumb)),
+                textures.handle(thumb_key, Some(&thumb), Rotation::UPRIGHT),
                 TextureState::Ready(_)
             ) && matches!(
-                textures.handle(screen_key, Some(&screen)),
+                textures.handle(screen_key, Some(&screen), Rotation::UPRIGHT),
                 TextureState::Ready(_)
             )
         });
@@ -1029,7 +1196,7 @@ mod tests {
 
         // A thumb decode is in flight when the loupe takes over the focus;
         // the epoch bump must cancel the off-screen thumb class.
-        textures.handle(thumb_key, Some(&file));
+        textures.handle(thumb_key, Some(&file), Rotation::UPRIGHT);
         textures.focus(&[screen_key]);
         let settled = env.settle(|| {
             textures.sync(&env.ctx);
@@ -1043,15 +1210,119 @@ mod tests {
         );
 
         // The focused screen class still loads normally afterwards.
-        textures.handle(screen_key, Some(&file));
+        textures.handle(screen_key, Some(&file), Rotation::UPRIGHT);
         let loaded = env.settle(|| {
             textures.sync(&env.ctx);
             matches!(
-                textures.handle(screen_key, Some(&file)),
+                textures.handle(screen_key, Some(&file), Rotation::UPRIGHT),
                 TextureState::Ready(_)
             )
         });
         assert!(loaded, "focused screen key never loaded");
+    }
+
+    // --- EXIF + manual rotation mapping ---
+
+    /// Builds a 2×2 image whose pixels read `[A B; C D]`, so every
+    /// transform below can be asserted against a hand-derived matrix.
+    fn marker_image() -> DynamicImage {
+        let colors = [
+            [255, 0, 0],   // A
+            [0, 255, 0],   // B
+            [0, 0, 255],   // C
+            [255, 255, 0], // D
+        ];
+        let mut image = image::RgbImage::new(2, 2);
+        for (index, color) in colors.iter().enumerate() {
+            image.put_pixel((index % 2) as u32, (index / 2) as u32, image::Rgb(*color));
+        }
+        DynamicImage::ImageRgb8(image)
+    }
+
+    fn pixel(image: &DynamicImage, x: u32, y: u32) -> [u8; 3] {
+        let rgb = image.to_rgb8();
+        rgb.get_pixel(x, y).0
+    }
+
+    #[test]
+    fn orient_upright_should_match_the_exif_transform_table() {
+        let cases: [(u16, [[u8; 3]; 4]); 8] = [
+            // 1: stored pixels are already upright.
+            (1, [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0]]),
+            // 2: mirrored horizontally.
+            (2, [[0, 255, 0], [255, 0, 0], [255, 255, 0], [0, 0, 255]]),
+            // 3: rotated 180°.
+            (3, [[255, 255, 0], [0, 0, 255], [0, 255, 0], [255, 0, 0]]),
+            // 4: mirrored vertically.
+            (4, [[0, 0, 255], [255, 255, 0], [255, 0, 0], [0, 255, 0]]),
+            // 5: transpose over the main diagonal.
+            (5, [[255, 0, 0], [0, 0, 255], [0, 255, 0], [255, 255, 0]]),
+            // 6: quarter turn clockwise.
+            (6, [[0, 0, 255], [255, 0, 0], [255, 255, 0], [0, 255, 0]]),
+            // 7: transverse (anti-diagonal mirror).
+            (7, [[255, 255, 0], [0, 255, 0], [0, 0, 255], [255, 0, 0]]),
+            // 8: quarter turn counter-clockwise.
+            (8, [[0, 255, 0], [255, 255, 0], [255, 0, 0], [0, 0, 255]]),
+        ];
+        for (orientation, expected) in cases {
+            let out = orient_upright(marker_image(), Rotation::new(orientation, 0));
+            for y in 0..2 {
+                for x in 0..2 {
+                    assert_eq!(
+                        pixel(&out, x, y),
+                        expected[(y * 2 + x) as usize],
+                        "orientation {orientation} pixel ({x},{y})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn user_turns_should_compose_with_the_exif_correction_sequentially() {
+        // A portrait EXIF flag plus one further CW turn is a half turn.
+        let combined = orient_upright(marker_image(), Rotation::new(6, 1));
+        let half = orient_upright(marker_image(), Rotation::new(3, 0));
+        assert_eq!(combined.to_rgba8().into_raw(), half.to_rgba8().into_raw());
+
+        // Four turns would be a no-op; three land back on one CCW turn.
+        let ccw = orient_upright(marker_image(), Rotation::new(1, 3));
+        let once_cw = orient_upright(marker_image(), Rotation::new(1, 1));
+        assert_ne!(ccw.to_rgba8().into_raw(), once_cw.to_rgba8().into_raw());
+    }
+
+    #[test]
+    fn rotating_a_visible_photo_should_replace_its_texture() {
+        let env = Env::new();
+        let file = env.jpeg("rot.jpg", 16, 12);
+        let mut textures = textures_with(prod_limits());
+        let key = TexKey::thumb(PhotoId(11));
+
+        textures.handle(key, Some(&file), Rotation::UPRIGHT);
+        let loaded = env.settle(|| {
+            textures.sync(&env.ctx);
+            matches!(
+                textures.handle(key, Some(&file), Rotation::UPRIGHT),
+                TextureState::Ready(_)
+            )
+        });
+        assert!(loaded, "initial load failed");
+
+        // The user presses ]: same asset path, new display rotation. The
+        // stale slot must be dropped and a rotated decode queued.
+        assert!(matches!(
+            textures.handle(key, Some(&file), Rotation::new(1, 1)),
+            TextureState::Loading
+        ));
+        let rotated = env.settle(|| {
+            textures.sync(&env.ctx);
+            matches!(
+                textures.handle(key, Some(&file), Rotation::new(1, 1)),
+                TextureState::Ready(_)
+            )
+        });
+        assert!(rotated, "rotated texture never became ready");
+        assert_eq!(textures.slots[&key].rotation, Rotation::new(1, 1));
     }
 
     #[test]
@@ -1084,7 +1355,11 @@ mod tests {
         let ctx = egui::Context::default();
         let mut textures = Textures::new();
         for (index, file) in files.iter().enumerate() {
-            textures.handle(TexKey::thumb(PhotoId(index as u64)), Some(file));
+            textures.handle(
+                TexKey::thumb(PhotoId(index as u64)),
+                Some(file),
+                Rotation::UPRIGHT,
+            );
         }
 
         let started = std::time::Instant::now();
@@ -1118,7 +1393,11 @@ mod tests {
         while textures.slots.len() < files.len() {
             assert!(frames < 200_000, "re-demand did not converge");
             for (index, file) in files.iter().enumerate() {
-                textures.handle(TexKey::thumb(PhotoId(index as u64)), Some(file));
+                textures.handle(
+                    TexKey::thumb(PhotoId(index as u64)),
+                    Some(file),
+                    Rotation::UPRIGHT,
+                );
             }
             while textures.busy() {
                 frame(&mut textures, &ctx, &mut worst);
@@ -1169,10 +1448,13 @@ mod tests {
         // Cold: demand → worker decode → upload must fit in 400 ms.
         let mut textures = Textures::new();
         let cold_started = std::time::Instant::now();
-        textures.handle(key, Some(&path));
+        textures.handle(key, Some(&path), Rotation::UPRIGHT);
         let ready = loop {
             textures.sync(&ctx);
-            if matches!(textures.handle(key, Some(&path)), TextureState::Ready(_)) {
+            if matches!(
+                textures.handle(key, Some(&path), Rotation::UPRIGHT),
+                TextureState::Ready(_)
+            ) {
                 break true;
             }
             if cold_started.elapsed() > std::time::Duration::from_secs(10) {
@@ -1192,7 +1474,7 @@ mod tests {
         for _ in 0..100 {
             textures.focus(&[key]);
             assert!(matches!(
-                textures.handle(key, Some(&path)),
+                textures.handle(key, Some(&path), Rotation::UPRIGHT),
                 TextureState::Ready(_)
             ));
             textures.sync(&ctx);
