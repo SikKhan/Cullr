@@ -19,6 +19,15 @@ pub enum Action {
     PickFolder,
     /// Scan the folder at this path and browse it in the grid.
     OpenFolder(PathBuf),
+    /// Copy these original files into a user-picked destination folder;
+    /// `root` identifies the grid that queued the request so stale jobs
+    /// (folder switched mid-export) can be dropped.
+    Export {
+        /// Folder every path in `files` was rooted at when scanned.
+        root: PathBuf,
+        /// Absolute paths of the originals to copy, in display order.
+        files: Vec<PathBuf>,
+    },
     /// Leave the grid and return Home.
     BackToHome,
     /// Open the About dialog (SPEC §10 T14).

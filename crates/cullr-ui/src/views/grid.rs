@@ -201,6 +201,20 @@ pub struct GridView {
     /// mount forces one frame back to the top instead of inheriting
     /// wherever an earlier session left off.
     reset_scroll: bool,
+    /// Files processed by the running export job, out of [`Self::export_total`].
+    export_done: usize,
+    /// Total files announced for the running export job.
+    export_total: usize,
+    /// Summary of the last finished export, shown beside the button until
+    /// the next run or folder change retires it.
+    export_note: Option<ExportNote>,
+}
+
+/// Finished-export summary pill content beside the export button.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExportNote {
+    text: String,
+    color: egui::Color32,
 }
 
 impl GridView {
@@ -236,6 +250,9 @@ impl GridView {
             settled_scroll_y: 0.0,
             settled_viewport_top: 0.0,
             reset_scroll: true,
+            export_done: 0,
+            export_total: 0,
+            export_note: None,
         }
     }
 
@@ -263,6 +280,9 @@ impl GridView {
                 // A fresh scan re-mounts the sheet: never resume from a
                 // scroll position left over by egui persistence.
                 self.reset_scroll = true;
+                self.export_done = 0;
+                self.export_total = 0;
+                self.export_note = None;
             }
             Err(message) => self.error = Some(message),
         }
@@ -311,6 +331,78 @@ impl GridView {
     /// `true` while a batch is still producing tiles.
     pub fn is_ingesting(&self) -> bool {
         self.ingest_done < self.ingest_total
+    }
+
+    /// Announces a running export of `total` original files.
+    pub fn begin_export(&mut self, total: usize) {
+        self.export_total = total;
+        self.export_done = 0;
+        self.export_note = None;
+    }
+
+    /// Applies one progress tick from the export worker; monotonic so a
+    /// late-arriving tick can never rewind the counter.
+    pub fn apply_export_progress(&mut self, done: usize) {
+        self.export_done = done.max(self.export_done);
+    }
+
+    /// Retires a finished export job with its user-facing summary line.
+    /// Partial failures and cancellation are reported honestly — the note
+    /// stays visible until the next run or folder change replaces it.
+    pub fn finish_export(&mut self, outcome: &Result<cullr_core::ExportReport, String>) {
+        let note = match outcome {
+            Ok(report) => {
+                let text = if report.cancelled {
+                    "Export cancelled".to_owned()
+                } else if report.failures.is_empty() && report.copied == 0 {
+                    "Nothing to copy".to_owned()
+                } else if report.failures.is_empty() {
+                    format!("✓ Exported {}", widgets::grouped(report.copied))
+                } else {
+                    format!(
+                        "Exported {} · {} failed",
+                        widgets::grouped(report.copied),
+                        widgets::grouped(report.failures.len())
+                    )
+                };
+                ExportNote {
+                    color: match report.cancelled || !report.failures.is_empty() {
+                        true => theme::RED,
+                        false => theme::ACCENT,
+                    },
+                    text,
+                }
+            }
+            Err(error) => ExportNote {
+                text: format!("Export failed: {error}"),
+                color: theme::RED,
+            },
+        };
+        self.export_note = Some(note);
+        self.export_done = self.export_total;
+    }
+
+    /// `true` while an export job is still copying files.
+    pub fn is_exporting(&self) -> bool {
+        self.export_done < self.export_total
+    }
+
+    /// Whether this grid still browses the folder a background event or
+    /// job belongs to; stale results for other roots are dropped.
+    pub fn is_browsing(&self, root: &std::path::Path) -> bool {
+        self.root == root
+    }
+
+    /// Absolute paths export should copy: the selection when one exists,
+    /// otherwise every photo surviving the filter — both in display order,
+    /// so the destination fills in sheet order.
+    pub fn export_set(&self) -> Vec<PathBuf> {
+        self.view
+            .iter()
+            .filter_map(|&row| self.entries.get(row))
+            .filter(|entry| self.selection.is_empty() || self.selection.contains(&entry.id))
+            .map(|entry| self.root.join(&entry.rel_path))
+            .collect()
     }
 
     /// Hands the app the latest changed set of visible pending photos for
@@ -374,6 +466,12 @@ impl GridView {
         } else {
             (false, false)
         };
+        // Export shortcut mirrors the bottom-right button; the scope is
+        // computed at press time exactly like a click would compute it.
+        let export_key = sheet_keys
+            && ui
+                .ctx()
+                .input(|input| input.key_pressed(egui::Key::E) && input.modifiers.command_only());
         // The filter preset key works everywhere in the folder, loupe
         // included, so "show me only what I marked" is one press away.
         if !self.loading && !suspended && ui.ctx().input(|input| input.key_pressed(egui::Key::F)) {
@@ -382,6 +480,15 @@ impl GridView {
         }
         if escape {
             action = Some(Action::BackToHome);
+        }
+        if export_key && !self.is_exporting() {
+            let files = self.export_set();
+            if !files.is_empty() {
+                action = Some(Action::Export {
+                    root: self.root.clone(),
+                    files,
+                });
+            }
         }
         // Tab and digits belong to whichever view is on screen: the
         // loupe handles its own copies, so the sheet must stay quiet
@@ -430,6 +537,18 @@ impl GridView {
         }
         egui::CentralPanel::default()
             .show(ui, |ui| self.body(ui, db, textures, columns, suspended));
+
+        // Floating export control pinned to the sheet's bottom-right
+        // corner; hidden in the states that have nothing to export
+        // (scanning, failure, empty folder, loupe up).
+        if !self.loading
+            && self.error.is_none()
+            && self.loupe.is_none()
+            && !self.view.is_empty()
+            && let Some(picked) = self.draw_export_control(ui.ctx())
+        {
+            action = Some(picked);
+        }
 
         // A sort picked in the bar applies here, where the db handle is
         // at hand for the stamp cache; re-anchoring keeps the cursor on
@@ -734,6 +853,62 @@ impl GridView {
                 return;
             }
         }
+    }
+
+    /// Floating export control: a pill anchored to the viewport's bottom-
+    /// right corner carrying the run progress / last-run note and the
+    /// button itself. Returns the export action when clicked. The scope
+    /// (selection first, filtered view otherwise) is resolved only on
+    /// click so relabeling never costs anything per frame.
+    fn draw_export_control(&self, ctx: &egui::Context) -> Option<Action> {
+        let mut picked = None;
+        egui::Area::new(egui::Id::new("cullr_export_control"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::RIGHT_BOTTOM, [-16.0, -16.0])
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(theme::PANEL)
+                    .corner_radius(10.0)
+                    .stroke(egui::Stroke::new(1.0, theme::MUTED.gamma_multiply(0.35)))
+                    .inner_margin(egui::Margin::symmetric(10, 6))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if let Some(note) = &self.export_note {
+                                ui.label(egui::RichText::new(&note.text).color(note.color));
+                            }
+                            let exporting = self.is_exporting();
+                            let label = if exporting {
+                                format!(
+                                    "Exporting {} / {}…",
+                                    widgets::grouped(self.export_done.min(self.export_total)),
+                                    widgets::grouped(self.export_total)
+                                )
+                            } else if self.selection.is_empty() {
+                                format!("Export {}", widgets::grouped(self.view.len()))
+                            } else {
+                                format!("Export {}", widgets::grouped(self.selection.len()))
+                            };
+                            let response = ui.add_enabled(!exporting, egui::Button::new(label));
+                            let hint = if exporting {
+                                "Copying originals…"
+                            } else if self.selection.is_empty() {
+                                "Copy these photos' original files to another folder — Ctrl+E"
+                            } else {
+                                "Copy the selected photos' original files to another folder — Ctrl+E"
+                            };
+                            if response.on_hover_text(hint).clicked() {
+                                let files = self.export_set();
+                                if !files.is_empty() {
+                                    picked = Some(Action::Export {
+                                        root: self.root.clone(),
+                                        files,
+                                    });
+                                }
+                            }
+                        });
+                    });
+            });
+        picked
     }
 
     /// Body: loupe when open, otherwise scanning notice, failure notice,
@@ -2160,6 +2335,132 @@ mod tests {
 
         assert!(grid.selection.is_empty());
         assert_eq!(grid.cursor, Some(1));
+    }
+
+    // --- export (bottom-right control, Ctrl+E) ---
+
+    use cullr_core::ExportReport;
+
+    #[test]
+    fn export_set_should_prefer_the_selection_over_the_filtered_view() {
+        let mut grid = grid_with(&[TestLabel::None, TestLabel::None, TestLabel::None]);
+        // Selection of the first and third photo.
+        grid.selection.insert(PhotoId(1));
+        grid.selection.insert(PhotoId(3));
+
+        let files = grid.export_set();
+
+        assert_eq!(
+            files,
+            vec![
+                PathBuf::from("/photos/IMG_0001.CR3"),
+                PathBuf::from("/photos/IMG_0003.CR3"),
+            ]
+        );
+    }
+
+    #[test]
+    fn export_set_should_fall_back_to_the_whole_filtered_view() {
+        let mut grid = grid_with(&[TestLabel::None, TestLabel::Red]);
+        grid.filter.toggle(TestLabel::Red);
+        grid.apply_order_change();
+        assert!(grid.selection.is_empty());
+
+        let files = grid.export_set();
+
+        assert_eq!(files, vec![PathBuf::from("/photos/IMG_0002.CR3")]);
+    }
+
+    #[test]
+    fn export_set_should_export_only_tiles_still_visible() {
+        // A refilter keeps selection membership of hidden photos for
+        // labeling continuity, but a batch export must never copy tiles
+        // the sheet no longer shows.
+        let mut grid = grid_with(&[TestLabel::Red, TestLabel::None]);
+        grid.select_all();
+        grid.filter.toggle(TestLabel::None);
+        grid.apply_order_change();
+
+        let files = grid.export_set();
+
+        assert_eq!(files, vec![PathBuf::from("/photos/IMG_0002.CR3")]);
+    }
+
+    #[test]
+    fn export_run_state_should_track_progress_and_summaries() {
+        let mut grid = grid_with(&[TestLabel::None, TestLabel::None]);
+
+        grid.begin_export(2);
+        assert!(grid.is_exporting());
+
+        grid.apply_export_progress(1);
+        grid.apply_export_progress(0);
+        assert_eq!(grid.export_done, 1, "progress must never rewind");
+
+        grid.finish_export(&Ok(ExportReport {
+            copied: 2,
+            failures: Vec::new(),
+            cancelled: false,
+        }));
+        assert!(!grid.is_exporting());
+        let note = grid.export_note.as_ref().expect("note set");
+        assert_eq!(note.text, "✓ Exported 2");
+
+        grid.begin_export(3);
+        grid.finish_export(&Ok(ExportReport {
+            copied: 1,
+            failures: vec![cullr_core::ExportFailure {
+                source: "/photos/a.nef".into(),
+                reason: "vanished".to_owned(),
+            }],
+            cancelled: false,
+        }));
+        let note = grid.export_note.as_ref().expect("note set");
+        assert!(note.text.contains("failed"), "{}", note.text);
+
+        grid.finish_export(&Ok(ExportReport {
+            copied: 0,
+            failures: Vec::new(),
+            cancelled: true,
+        }));
+        assert_eq!(
+            grid.export_note.as_ref().map(|note| note.text.as_str()),
+            Some("Export cancelled")
+        );
+    }
+
+    #[test]
+    fn finish_export_should_report_a_failed_job_and_nothing_to_copy() {
+        let mut grid = grid_with(&[TestLabel::None]);
+
+        grid.finish_export(&Err("destination rejected".to_owned()));
+        let note = grid.export_note.as_ref().expect("note set");
+        assert!(note.text.contains("destination rejected"), "{}", note.text);
+
+        // Destination equal to the source folder copies nothing: say so
+        // instead of claiming a successful export of zero files.
+        grid.finish_export(&Ok(ExportReport::default()));
+        assert_eq!(
+            grid.export_note.as_ref().map(|note| note.text.as_str()),
+            Some("Nothing to copy")
+        );
+    }
+
+    #[test]
+    fn apply_scan_should_retire_finished_export_state() {
+        let mut grid = grid_with(&[TestLabel::None]);
+        grid.begin_export(4);
+        grid.apply_export_progress(2);
+
+        let fresh = (0..2)
+            .map(|index| entry_at(index as u64 + 10, TestLabel::None))
+            .collect();
+        grid.apply_scan(Ok(fresh));
+
+        assert!(!grid.is_exporting());
+        assert_eq!(grid.export_note, None);
+        assert!(grid.is_browsing(std::path::Path::new("/photos")));
+        assert!(!grid.is_browsing(std::path::Path::new("/other")));
     }
 
     // --- manual rotation (SPEC §6 keyboard map) ---

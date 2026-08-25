@@ -4,6 +4,8 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use eframe::egui;
@@ -37,6 +39,29 @@ enum Event {
         /// Ordered index entries, or a user-facing error message.
         result: Result<Vec<PhotoEntry>, String>,
     },
+    /// An export run advanced by one file.
+    ExportProgress {
+        /// Root whose grid owns the run; stale ticks are dropped.
+        root: PathBuf,
+        /// Files processed so far, out of the announced total.
+        done: usize,
+    },
+    /// An export run finished (cancelled runs report through the report).
+    ExportFinished {
+        /// Root whose grid owns the run; stale reports are dropped.
+        root: PathBuf,
+        /// Copy outcome, or a user-facing message for destination-level
+        /// failures (missing / non-directory destination).
+        result: Result<cullr_core::ExportReport, String>,
+    },
+}
+
+/// A running export job's identity and cancellation switch.
+struct ExportJob {
+    /// Folder the exported files were scanned from, for staleness checks.
+    root: PathBuf,
+    /// Polled by the worker before every file copy.
+    cancel: Arc<AtomicBool>,
 }
 
 /// Which screen is currently mounted. The grid state is boxed: it is by
@@ -67,6 +92,8 @@ pub struct App {
     /// Help overlay + About dialog (SPEC §10 T14); drawn above whatever
     /// screen is mounted, which stays suspended while either is open.
     modals: Modals,
+    /// Export run in flight, if any; cancelled when the folder changes.
+    export_job: Option<ExportJob>,
 }
 
 impl App {
@@ -99,6 +126,15 @@ impl App {
             ingest_generation: 0,
             textures: Textures::new(),
             modals: Modals::default(),
+            export_job: None,
+        }
+    }
+
+    /// Cancels any in-flight export job; used when the browsed folder is
+    /// about to change so a superseded run stops touching disk.
+    fn cancel_export(&mut self) {
+        if let Some(job) = self.export_job.take() {
+            job.cancel.store(true, Ordering::Relaxed);
         }
     }
 
@@ -110,6 +146,7 @@ impl App {
         if let Some(pipeline) = &self.pipeline {
             pipeline.cancel();
         }
+        self.cancel_export();
         self.scanning = Some(root.clone());
         let auto_advance = widgets::load_auto_advance(&self.db);
         self.screen = Screen::Grid(Box::new(GridView::new(root.clone(), auto_advance)));
@@ -149,24 +186,45 @@ impl App {
     /// Applies finished background jobs to the mounted screen.
     fn drain_events(&mut self) {
         while let Ok(event) = self.events_rx.try_recv() {
-            let Event::ScanFinished { root, result } = event;
-            if self.scanning.as_ref() != Some(&root) {
-                continue;
-            }
-            self.scanning = None;
-            match (&mut self.screen, result) {
-                (Screen::Grid(grid), outcome) => {
-                    // Purge texture state from any other folder before the
-                    // sheet mounts: cancelled batches stop occupying decode
-                    // and GPU budget, while this folder's warm cache stays.
-                    if let Ok(entries) = &outcome {
-                        let keep: HashSet<PhotoId> = entries.iter().map(|e| e.id).collect();
-                        self.textures.retain(&keep);
+            match event {
+                Event::ScanFinished { root, result } => {
+                    if self.scanning.as_ref() != Some(&root) {
+                        continue;
                     }
-                    grid.apply_scan(outcome);
-                    self.start_ingest(&root);
+                    self.scanning = None;
+                    match (&mut self.screen, result) {
+                        (Screen::Grid(grid), outcome) => {
+                            // Purge texture state from any other folder before the
+                            // sheet mounts: cancelled batches stop occupying decode
+                            // and GPU budget, while this folder's warm cache stays.
+                            if let Ok(entries) = &outcome {
+                                let keep: HashSet<PhotoId> = entries.iter().map(|e| e.id).collect();
+                                self.textures.retain(&keep);
+                            }
+                            grid.apply_scan(outcome);
+                            self.start_ingest(&root);
+                        }
+                        (Screen::Home(_), _) => {}
+                    }
                 }
-                (Screen::Home(_), _) => {}
+                Event::ExportProgress { root, done } => {
+                    if let (Screen::Grid(grid), Some(_)) = (&mut self.screen, &self.export_job)
+                        && grid.is_browsing(&root)
+                    {
+                        grid.apply_export_progress(done);
+                    }
+                }
+                Event::ExportFinished { root, result } => {
+                    if !self.export_job.as_ref().is_some_and(|job| job.root == root) {
+                        continue;
+                    }
+                    self.cancel_export();
+                    if let Screen::Grid(grid) = &mut self.screen
+                        && grid.is_browsing(&root)
+                    {
+                        grid.finish_export(&result);
+                    }
+                }
             }
         }
         if let Some(rx) = &self.ingest_rx {
@@ -234,7 +292,7 @@ impl App {
     /// idle screens cost zero wakeups.
     fn schedule_repaint(&self, ctx: &egui::Context) {
         let busy = self.scanning.is_some()
-            || matches!(&self.screen, Screen::Grid(grid) if grid.is_ingesting())
+            || matches!(&self.screen, Screen::Grid(grid) if grid.is_ingesting() || grid.is_exporting())
             || self.textures.busy();
         if busy {
             ctx.request_repaint_after(FRAME_PULSE);
@@ -252,11 +310,39 @@ impl App {
                 }
             }
             Some(Action::OpenFolder(path)) => self.open_folder(path),
+            Some(Action::Export { root, files }) => {
+                // Blocking native dialog; a cancelled pick is a no-op.
+                let Some(dest) = rfd::FileDialog::new().pick_folder() else {
+                    return;
+                };
+                let total = files.len();
+                let cancel = Arc::new(AtomicBool::new(false));
+                self.export_job = Some(ExportJob {
+                    root: root.clone(),
+                    cancel: Arc::clone(&cancel),
+                });
+                if let Screen::Grid(grid) = &mut self.screen {
+                    grid.begin_export(total);
+                }
+                let sender = self.events_tx.clone();
+                tracing::info!(count = total, ?root, ?dest, "export started");
+                std::thread::spawn(move || {
+                    let result = cullr_core::export_files(&files, &dest, &cancel, |done| {
+                        let _sent = sender.send(Event::ExportProgress {
+                            root: root.clone(),
+                            done,
+                        });
+                    })
+                    .map_err(|error| error.to_string());
+                    let _sent = sender.send(Event::ExportFinished { root, result });
+                });
+            }
             Some(Action::BackToHome) => {
                 self.scanning = None;
                 if let Some(pipeline) = &self.pipeline {
                     pipeline.cancel();
                 }
+                self.cancel_export();
                 self.screen = Screen::Home(HomeView);
             }
             Some(Action::ShowAbout) => self.modals.open_about(),

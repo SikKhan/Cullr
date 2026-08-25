@@ -126,6 +126,7 @@ Views: Home → Grid ⇄ Loupe. Top bar persists in Grid/Loupe.
 | `Enter` / `Esc` | loupe ⇄ grid |
 | `Space` | loupe: fit/100% · grid: enter loupe |
 | `Ctrl+A` / `Shift+A` | select all / none |
+| `Ctrl+E` | export originals: selection, else the filtered view (bottom-right button) |
 | `F` | cycle filter preset: All → Labeled → Unlabeled |
 | `?` | shortcut overlay |
 

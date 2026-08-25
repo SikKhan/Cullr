@@ -23,6 +23,7 @@ Culling speed comes from embedded JPEG previews, never full RAW decode. The cont
 - Auto-advance after labeling (`Tab` toggle, persisted)
 - Filter chips with live per-label counts; `F` cycles All → Labeled → Unlabeled presets
 - Selection: click, Ctrl-click, Shift-click range, drag marquee; batch labeling with one keystroke
+- Export: copy the originals of your selection (or filtered view) to any folder — bottom-right button or `Ctrl+E`, cross-platform native folder picker
 - Cell-size zoom slider + Ctrl+wheel (128–1024 px)
 - Sort by filename or taken_at
 - `?` shortcut overlay
@@ -65,6 +66,7 @@ Linux-first (X11 and Wayland verified), portable anywhere Rust builds. No system
 | `Enter` / `Esc` | loupe ⇄ grid |
 | `Space` | loupe: fit/100% · grid: enter loupe |
 | `Ctrl+A` / `Shift+A` | select all / none |
+| `Ctrl+E` | export originals (selection, else filtered view) |
 | `F` | cycle filter preset: All → Labeled → Unlabeled |
 | `?` | shortcut overlay |
 

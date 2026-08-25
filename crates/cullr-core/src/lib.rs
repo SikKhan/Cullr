@@ -24,6 +24,7 @@
 pub mod cache;
 pub mod db;
 pub mod exif;
+pub mod export;
 pub mod extract;
 pub mod ingest;
 pub mod model;
@@ -31,6 +32,7 @@ pub mod scanner;
 
 pub use cache::{Cache, CacheError};
 pub use db::{Db, DbError, now_millis};
+pub use export::{ExportError, ExportFailure, ExportReport, export_files};
 pub use extract::{ExtractError, extract_file, is_supported_extension};
 pub use ingest::{IngestEvent, IngestPipeline};
 pub use model::{
