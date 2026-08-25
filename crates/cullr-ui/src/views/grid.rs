@@ -1098,17 +1098,42 @@ impl GridView {
 
         // One-shot scroll-into-view after arrow/auto-advance/refilter
         // moves: egui 0.36 has no request-a-row API, so the pixel offset
-        // of the target row is computed and applied exactly once. The
-        // salt keeps this sheet's persisted state separate from every
-        // other ScrollArea in the app (they share egui's default id).
+        // of the target row is computed and applied exactly once. Only
+        // rows outside the last settled viewport move the sheet, and
+        // then just enough to come fully into view — re-centering on
+        // every step would yank the sheet around and make tiles flicker
+        // whenever an arrow walks along already-visible cells. The salt
+        // keeps this sheet's persisted state separate from every other
+        // ScrollArea in the app (they share egui's default id).
         let mut scroll = egui::ScrollArea::vertical()
             .auto_shrink(false)
             .id_salt("cullr_contact_sheet");
-        if let Some(row) = self.scroll_target.take() {
+        if let Some(position) = self.scroll_target.take() {
             let content_height = total_rows.max(1) as f32 * geom.stride_y() + GAP;
-            let centered =
-                row as f32 * geom.stride_y() + geom.height / 2.0 - ui.available_height() / 2.0;
-            scroll = scroll.vertical_scroll_offset(centered.clamp(0.0, content_height));
+            let viewport = ui.available_height();
+            // The queue holds a filtered-order position; scrolling works
+            // in whole display rows.
+            let row = position / columns.max(1);
+            let row_top = row as f32 * geom.stride_y();
+            let row_bottom = row_top + geom.height;
+            let view_top = self.settled_scroll_y;
+            let revealed = if row_top < view_top {
+                // Above the viewport: pull up to its top edge.
+                row_top - GAP
+            } else if row_bottom > view_top + viewport {
+                // Below the viewport: push down until its bottom edge
+                // clears the fold; a row taller than the viewport itself
+                // can only ever show its top.
+                if geom.height > viewport {
+                    row_top - GAP
+                } else {
+                    row_bottom + GAP - viewport
+                }
+            } else {
+                // Fully visible already: hands off the sheet.
+                view_top
+            };
+            scroll = scroll.vertical_scroll_offset(revealed.clamp(0.0, content_height));
         } else if self.reset_scroll {
             scroll = scroll.vertical_scroll_offset(0.0);
         }
@@ -2488,6 +2513,93 @@ mod tests {
         assert_eq!(
             mounted.offset_y, 0.0,
             "a fresh folder must not inherit the old scroll"
+        );
+    }
+
+    fn key(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
+    /// The reported bug: arrowing between tiles re-centered the sheet on
+    /// every step, so the whole view visibly jumped and freshly exposed
+    /// rows streamed in — while clicking tiles left it alone. A cursor
+    /// move within the visible rows must not move the sheet at all.
+    #[test]
+    fn arrows_across_visible_tiles_should_not_scroll_the_sheet() {
+        let mut bench = Bench::new();
+        let mut grid = scanned_grid(2000, 1);
+        bench.step(&mut grid, &[pointer_over_sheet()]);
+        bench.idle(&mut grid, 5);
+
+        // Five columns at this window size: right walks one tile, down
+        // one row. All land inside the initially visible rows.
+        for _ in 0..3 {
+            bench.step(&mut grid, &[key(egui::Key::ArrowRight)]);
+        }
+        for _ in 0..2 {
+            bench.step(&mut grid, &[key(egui::Key::ArrowDown)]);
+        }
+        let frames = bench.idle(&mut grid, 10);
+
+        for frame in frames {
+            assert_eq!(
+                frame.offset_y, 0.0,
+                "an arrow move onto an already-visible row moved the sheet"
+            );
+        }
+    }
+
+    /// Arrowing past the bottom edge must reveal the new row with the
+    /// smallest possible offset change (not a re-center), and stepping
+    /// back up into fully visible rows must not scroll again.
+    #[test]
+    fn arrows_below_the_fold_should_reveal_the_new_row_minimally() {
+        let mut bench = Bench::new();
+        let mut grid = scanned_grid(2000, 1);
+        let geom = CellGeom::default();
+        bench.step(&mut grid, &[pointer_over_sheet()]);
+        bench.idle(&mut grid, 5);
+
+        // Walk down until the first press scrolls; five columns make
+        // each ArrowDown one display row.
+        let mut downs = 0_usize;
+        let mut offset = 0.0_f32;
+        while offset <= 0.0 {
+            downs += 1;
+            assert!(downs < 20, "arrowing down never scrolled the sheet");
+            offset = bench.step(&mut grid, &[key(egui::Key::ArrowDown)]).offset_y;
+        }
+
+        // The minimal reveal pins the new row's bottom edge just inside
+        // the viewport, so the settled viewport height is derivable from
+        // that first adjustment alone.
+        let row = downs;
+        let viewport = row as f32 * geom.stride_y() + geom.height + GAP - offset;
+        assert!(
+            viewport > 0.0 && viewport < 800.0,
+            "nonsensical viewport {viewport}"
+        );
+
+        // One further row below the fold: exactly the same viewport
+        // worth of deficit again — not a jump to screen center.
+        let expected = (row + 1) as f32 * geom.stride_y() + geom.height + GAP - viewport;
+        let next = bench.step(&mut grid, &[key(egui::Key::ArrowDown)]).offset_y;
+        assert!(
+            (next - expected).abs() < 1.0,
+            "expected minimal reveal {expected}, got {next}"
+        );
+
+        // Stepping back up lands on a fully visible row: no movement.
+        let up = bench.step(&mut grid, &[key(egui::Key::ArrowUp)]).offset_y;
+        assert_eq!(
+            up, next,
+            "an upward step onto a visible row moved the sheet"
         );
     }
 }
