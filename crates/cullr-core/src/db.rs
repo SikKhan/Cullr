@@ -44,7 +44,7 @@ use crate::model::{
 use crate::scanner::ScanOptions;
 
 /// Schema revision this build understands; bumped with every migration.
-const LATEST_VERSION: i64 = 2;
+const LATEST_VERSION: i64 = 3;
 
 /// Migration scripts indexed by target version minus one.
 ///
@@ -78,6 +78,12 @@ CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);
 -- v2: user-applied display rotation. Quarter-turns clockwise stacked on
 -- top of the EXIF orientation flag; survives re-ingest like `label` does.
 ALTER TABLE photos ADD COLUMN rot_cw INTEGER NOT NULL DEFAULT 0;
+"#,
+    r#"
+-- v3: RAW+JPEG pairs. Relative path of the companion JPEG shot alongside
+-- the RAW (same stem, same directory); NULL for unpaired photos. Purely
+-- display/export metadata — extraction always works from the RAW itself.
+ALTER TABLE photos ADD COLUMN jpeg_rel_path TEXT;
 "#,
 ];
 
@@ -193,8 +199,8 @@ impl Db {
 
             {
                 let mut insert = tx.prepare_cached(
-                    "INSERT INTO photos (root, rel_path, mtime, size, status)
-                     VALUES (?1, ?2, ?3, ?4, 0)",
+                    "INSERT INTO photos (root, rel_path, mtime, size, status, jpeg_rel_path)
+                     VALUES (?1, ?2, ?3, ?4, 0, ?5)",
                 )?;
                 let mut reset = tx.prepare_cached(
                     "UPDATE photos SET mtime = ?2, size = ?3, status = 0,
@@ -202,12 +208,18 @@ impl Db {
                         camera = NULL, lens = NULL, taken_at = NULL,
                         shutter = NULL, aperture = NULL, iso = NULL, focal_mm = NULL,
                         err_msg = NULL, preview_path = NULL, thumb_path = NULL,
-                        ingested_at = NULL
+                        ingested_at = NULL, jpeg_rel_path = ?4
                      WHERE id = ?1",
                 )?;
+                let mut reattach_jpeg =
+                    tx.prepare_cached("UPDATE photos SET jpeg_rel_path = ?2 WHERE id = ?1")?;
 
                 for meta in scanned {
                     let mtime = system_time_to_i64(meta.mtime);
+                    let jpeg_text = meta
+                        .jpeg_rel_path
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().into_owned());
                     match existing.get(meta.rel_path.as_path()) {
                         None => {
                             insert.execute(params![
@@ -215,13 +227,26 @@ impl Db {
                                 meta.rel_path.to_string_lossy(),
                                 mtime,
                                 narrow_u64(meta.size),
+                                jpeg_text,
                             ])?;
                         }
                         Some(row) if row.needs_refresh(mtime, meta.size) => {
-                            reset.execute(params![row.id, mtime, narrow_u64(meta.size)])?;
+                            reset.execute(params![
+                                row.id,
+                                mtime,
+                                narrow_u64(meta.size),
+                                jpeg_text,
+                            ])?;
                         }
-                        // Unchanged: keep row id, label and any ingest state.
-                        Some(_) => {}
+                        // Unchanged RAW: keep id, label and ingest state; the
+                        // pairing can still have changed (JPEG added or
+                        // removed next to an untouched file), and that must
+                        // not cost a re-extraction.
+                        Some(row) => {
+                            if row.jpeg != jpeg_text {
+                                reattach_jpeg.execute(params![row.id, jpeg_text])?;
+                            }
+                        }
                     }
                 }
 
@@ -254,7 +279,7 @@ impl Db {
     pub fn pending_photos(&self, root: &Path) -> Result<Vec<PendingPhoto>, DbError> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare_cached(
-                "SELECT id, rel_path, mtime, size FROM photos
+                "SELECT id, rel_path, mtime, size, jpeg_rel_path FROM photos
                  WHERE root = ?1 AND status = 0 ORDER BY rel_path",
             )?;
             let root_text = root.to_string_lossy().into_owned();
@@ -266,6 +291,7 @@ impl Db {
                         rel_path: PathBuf::from(row.get::<_, String>(1)?),
                         mtime: i64_to_system_time(row.get::<_, i64>(2)?),
                         size: widen_to_u64(row.get::<_, i64>(3)?),
+                        jpeg_rel_path: row.get::<_, Option<String>>(4)?.map(PathBuf::from),
                     },
                 })
             })?;
@@ -401,7 +427,7 @@ impl Db {
     pub fn photo_entry(&self, id: PhotoId) -> Result<Option<PhotoEntry>, DbError> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare_cached(
-                "SELECT rel_path, label, status, width, height, orientation, thumb_path, err_msg, rot_cw
+                "SELECT rel_path, label, status, width, height, orientation, thumb_path, err_msg, rot_cw, jpeg_rel_path
                  FROM photos WHERE id = ?1",
             )?;
             let mut rows = stmt.query([narrow_u64(id.0)])?;
@@ -426,7 +452,7 @@ impl Db {
             let mut stmt = conn.prepare_cached(
                 "SELECT rel_path, label, status, width, height, orientation,
                         preview_path, thumb_path, camera, lens, taken_at,
-                        shutter, aperture, iso, focal_mm, err_msg, rot_cw
+                        shutter, aperture, iso, focal_mm, err_msg, rot_cw, jpeg_rel_path
                  FROM photos WHERE id = ?1",
             )?;
             let mut rows = stmt.query([narrow_u64(id.0)])?;
@@ -461,6 +487,7 @@ impl Db {
                         focal_mm: row.get(14)?,
                         err_msg: row.get(15)?,
                         rot_cw: rot_cw_of(row.get::<_, i64>(16)?),
+                        jpeg_rel_path: row.get::<_, Option<String>>(17)?.map(PathBuf::from),
                     }))
                 }
             }
@@ -534,6 +561,7 @@ struct ExistingRow {
     mtime: i64,
     size: u64,
     status: PhotoStatus,
+    jpeg: Option<String>,
 }
 
 impl ExistingRow {
@@ -569,8 +597,9 @@ fn load_existing(
     tx: &rusqlite::Transaction<'_>,
     root: &str,
 ) -> Result<HashMap<PathBuf, ExistingRow>, DbError> {
-    let mut stmt =
-        tx.prepare("SELECT id, rel_path, mtime, size, status FROM photos WHERE root = ?1")?;
+    let mut stmt = tx.prepare(
+        "SELECT id, rel_path, mtime, size, status, jpeg_rel_path FROM photos WHERE root = ?1",
+    )?;
     let rows = stmt.query_map([root], |row| {
         Ok(ExistingRow {
             id: row.get(0)?,
@@ -579,6 +608,7 @@ fn load_existing(
             size: widen_to_u64(row.get::<_, i64>(3)?),
             status: PhotoStatus::from_u8(u8::try_from(row.get::<_, i64>(4)?).unwrap_or(0))
                 .unwrap_or_default(),
+            jpeg: row.get(5)?,
         })
     })?;
     let mut map = HashMap::new();
@@ -592,7 +622,7 @@ fn load_existing(
 fn load_entries(tx: &rusqlite::Transaction<'_>, root: &str) -> Result<Vec<PhotoEntry>, DbError> {
     // Missing rows stay out of navigation entirely (SPEC §7).
     let mut stmt = tx.prepare(
-        "SELECT id, rel_path, label, status, width, height, orientation, thumb_path, err_msg, rot_cw
+        "SELECT id, rel_path, label, status, width, height, orientation, thumb_path, err_msg, rot_cw, jpeg_rel_path
          FROM photos WHERE root = ?1 AND status <> 3",
     )?;
     let rows = stmt.query_map([root], |row| {
@@ -614,7 +644,7 @@ fn load_entries(tx: &rusqlite::Transaction<'_>, root: &str) -> Result<Vec<PhotoE
 /// row. `rel_path` comes from the caller because the two query shapes
 /// select it at different positions; `base` is the column index of `label`
 /// followed by `status, width, height, orientation, thumb_path, err_msg,
-/// rot_cw`.
+/// rot_cw, jpeg_rel_path`.
 fn entry_from_row(
     id: PhotoId,
     rel_path: PathBuf,
@@ -638,6 +668,7 @@ fn entry_from_row(
         rot_cw: rot_cw_of(row.get::<_, i64>(base + 7)?),
         thumb_path: row.get::<_, Option<String>>(base + 5)?.map(PathBuf::from),
         err_msg: row.get(base + 6)?,
+        jpeg_rel_path: row.get::<_, Option<String>>(base + 8)?.map(PathBuf::from),
     })
 }
 
@@ -724,6 +755,7 @@ mod tests {
             rel_path: PathBuf::from(name),
             mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(mtime_secs),
             size,
+            jpeg_rel_path: None,
         }
     }
 
@@ -757,6 +789,7 @@ mod tests {
             rot_cw: 0,
             thumb_path: None,
             err_msg: None,
+            jpeg_rel_path: None,
         }
     }
 
@@ -1056,6 +1089,113 @@ mod tests {
     }
 
     #[test]
+    fn sync_scan_should_persist_the_companion_jpeg_of_a_pair() {
+        let fx = open_db();
+        let root = fx._dir.path();
+        let paired = vec![PhotoMeta {
+            jpeg_rel_path: Some("a.jpg".into()),
+            ..meta(root, "a.nef", 1, 10)
+        }];
+
+        let entries = fx
+            .db
+            .sync_scan(root, &paired, ScanOptions::default())
+            .expect("sync");
+
+        assert_eq!(
+            entries[0].jpeg_rel_path.as_deref(),
+            Some(Path::new("a.jpg"))
+        );
+        // The stored row round-trips through the point queries too.
+        let entry = fx
+            .db
+            .photo_entry(entries[0].id)
+            .expect("read")
+            .expect("row");
+        assert_eq!(entry.jpeg_rel_path.as_deref(), Some(Path::new("a.jpg")));
+        let detail = fx
+            .db
+            .photo_detail(entries[0].id)
+            .expect("read")
+            .expect("row");
+        assert_eq!(detail.jpeg_rel_path.as_deref(), Some(Path::new("a.jpg")));
+    }
+
+    #[test]
+    fn rescan_should_repair_pairing_without_reingesting_unchanged_raws() {
+        let fx = open_db();
+        let root = fx._dir.path();
+        let paired = vec![PhotoMeta {
+            jpeg_rel_path: Some("a.jpg".into()),
+            ..meta(root, "a.nef", 1, 10)
+        }];
+        let first = fx
+            .db
+            .sync_scan(root, &paired, ScanOptions::default())
+            .expect("first sync");
+        fx.db
+            .record_ingest_ok(
+                first[0].id,
+                &IngestInfo {
+                    width: 100,
+                    height: 50,
+                    orientation: 1,
+                    camera: None,
+                    lens: None,
+                    taken_at: None,
+                    shutter: None,
+                    aperture: None,
+                    iso: None,
+                    focal_mm: None,
+                    preview_path: "p.jpg".into(),
+                    thumb_path: "t.jpg".into(),
+                },
+            )
+            .expect("ingest ok");
+
+        // JPEG deleted next to an untouched RAW: pairing clears, ingest
+        // state survives.
+        let alone = vec![meta(root, "a.nef", 1, 10)];
+        let second = fx
+            .db
+            .sync_scan(root, &alone, ScanOptions::default())
+            .expect("second sync");
+        assert_eq!(second[0].status, PhotoStatus::Ok);
+        assert_eq!(second[0].jpeg_rel_path, None);
+
+        // JPEG appears again: pairing returns, still no re-extraction.
+        let third = fx
+            .db
+            .sync_scan(root, &paired, ScanOptions::default())
+            .expect("third sync");
+        assert_eq!(third[0].status, PhotoStatus::Ok);
+        assert_eq!(third[0].jpeg_rel_path.as_deref(), Some(Path::new("a.jpg")));
+    }
+
+    #[test]
+    fn changed_raws_should_reset_to_pending_with_their_current_pairing() {
+        let fx = open_db();
+        let root = fx._dir.path();
+        let original = vec![PhotoMeta {
+            jpeg_rel_path: Some("a.jpg".into()),
+            ..meta(root, "a.nef", 1, 10)
+        }];
+        fx.db
+            .sync_scan(root, &original, ScanOptions::default())
+            .expect("first sync");
+
+        // The RAW itself changed and its companion vanished meanwhile; the
+        // reset must land on the fresh (unpaired) state, not the stale one.
+        let changed_unpaired = vec![meta(root, "a.nef", 2, 10)];
+        let second = fx
+            .db
+            .sync_scan(root, &changed_unpaired, ScanOptions::default())
+            .expect("resync");
+        assert_eq!(second[0].status, PhotoStatus::Pending);
+        assert_eq!(second[0].jpeg_rel_path, None);
+    }
+
+    #[test]
     fn pending_photos_should_return_only_unprocessed_rows_with_file_identity() {
         let fx = open_db();
         let root = fx._dir.path();
@@ -1066,12 +1206,14 @@ mod tests {
                 rel_path: "a.nef".into(),
                 mtime,
                 size: 123,
+                jpeg_rel_path: None,
             },
             PhotoMeta {
                 root: root.to_owned(),
                 rel_path: "b.arw".into(),
                 mtime,
                 size: 456,
+                jpeg_rel_path: None,
             },
         ];
         let entries = fx
@@ -1109,6 +1251,7 @@ mod tests {
                     rel_path: "b.arw".into(),
                     mtime,
                     size: 456,
+                    jpeg_rel_path: None,
                 },
             }]
         );
@@ -1124,6 +1267,7 @@ mod tests {
             rel_path: "old.orf".into(),
             mtime: pre_epoch,
             size: 7,
+            jpeg_rel_path: None,
         }];
         fx.db
             .sync_scan(root, &scanned, ScanOptions::default())

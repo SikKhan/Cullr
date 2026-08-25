@@ -769,6 +769,7 @@ mod tests {
             rot_cw: 0,
             thumb_path: None,
             err_msg: None,
+            jpeg_rel_path: None,
         };
         // Fit rect is 1500 px wide: 100% needs exactly 2×.
         assert!((max_zoom(&entry, egui::vec2(1500.0, 1000.0)) - 2.0).abs() < 1e-5);
@@ -786,6 +787,7 @@ mod tests {
             rot_cw: 0,
             thumb_path: None,
             err_msg: None,
+            jpeg_rel_path: None,
         };
         // Displayed portrait at fit width 1333 px: parity needs the
         // stored height (4000), not the stored width.
@@ -805,6 +807,7 @@ mod tests {
             rot_cw: 0,
             thumb_path: None,
             err_msg: None,
+            jpeg_rel_path: None,
         };
         assert_eq!(max_zoom(&entry, egui::vec2(500.0, 500.0)), 1.0);
     }
@@ -828,6 +831,7 @@ mod tests {
             iso: None,
             focal_mm: None,
             err_msg: None,
+            jpeg_rel_path: None,
         };
         fields(&mut detail);
         detail
@@ -844,6 +848,7 @@ mod tests {
             rot_cw: 0,
             thumb_path: None,
             err_msg: None,
+            jpeg_rel_path: None,
         }
     }
 

@@ -30,6 +30,10 @@ pub struct PhotoMeta {
     pub mtime: SystemTime,
     /// File size in bytes.
     pub size: u64,
+    /// Companion JPEG shot alongside this RAW (same directory, same stem),
+    /// when the camera wrote both. The pair shows as one photo — the RAW —
+    /// and exports copy both files; `None` when no sibling JPEG exists.
+    pub jpeg_rel_path: Option<PathBuf>,
 }
 
 /// Color label applied to a photo during culling.
@@ -169,6 +173,10 @@ pub struct PhotoEntry {
     /// Extraction failure description shown in error tiles (SPEC §7);
     /// `None` unless status is [`PhotoStatus::Error`].
     pub err_msg: Option<String>,
+    /// Companion JPEG shot alongside this RAW, as a path relative to the
+    /// scan root; `None` for photos without a same-stem sibling JPEG.
+    /// Display-only plus export: extraction always works from the RAW.
+    pub jpeg_rel_path: Option<PathBuf>,
 }
 
 impl PhotoEntry {
@@ -259,6 +267,9 @@ pub struct PhotoDetail {
     /// Extraction failure description; `None` unless status is
     /// [`PhotoStatus::Error`].
     pub err_msg: Option<String>,
+    /// Companion JPEG shot alongside this RAW, relative to the scan root;
+    /// `None` for photos without a same-stem sibling JPEG.
+    pub jpeg_rel_path: Option<PathBuf>,
 }
 
 /// A photo row awaiting ingest: its stable id plus the on-disk identity
@@ -322,6 +333,7 @@ mod tests {
             rot_cw: 0,
             thumb_path: None,
             err_msg: None,
+            jpeg_rel_path: None,
         };
         assert!((entry.display_aspect() - 1.5).abs() < f32::EPSILON);
     }
@@ -338,6 +350,7 @@ mod tests {
             rot_cw,
             thumb_path: None,
             err_msg: None,
+            jpeg_rel_path: None,
         };
         assert!((make(1, 0).display_aspect() - 1.5).abs() < 0.01);
         assert!((make(3, 0).display_aspect() - 1.5).abs() < 0.01);
@@ -357,6 +370,7 @@ mod tests {
             rot_cw,
             thumb_path: None,
             err_msg: None,
+            jpeg_rel_path: None,
         };
         assert_eq!(make(0).display_pixels(), Some((6000, 4000)));
         assert_eq!(make(1).display_pixels(), Some((4000, 6000)));
@@ -377,6 +391,7 @@ mod tests {
             rot_cw: 3,
             thumb_path: None,
             err_msg: None,
+            jpeg_rel_path: None,
         };
         // Portrait EXIF rotated once more CCW lands back on landscape.
         assert_eq!(entry.display_pixels(), Some((6000, 4000)));

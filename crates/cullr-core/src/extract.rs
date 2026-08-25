@@ -102,6 +102,7 @@ pub fn is_supported_extension(extension: &[u8]) -> bool {
 ///     rel_path: "garbage.CR3".into(),
 ///     mtime: SystemTime::UNIX_EPOCH,
 ///     size: 3,
+///     jpeg_rel_path: None,
 /// };
 /// std::fs::write(dir.path().join("garbage.CR3"), b"junk").unwrap();
 ///
@@ -373,6 +374,7 @@ mod tests {
             rel_path: name.into(),
             mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
             size: contents.len() as u64,
+            jpeg_rel_path: None,
         }
     }
 
@@ -401,6 +403,7 @@ mod tests {
             rel_path: "missing.nef".into(),
             mtime: SystemTime::UNIX_EPOCH,
             size: 0,
+            jpeg_rel_path: None,
         };
 
         let result = extract_file(&photo, &cache);

@@ -69,8 +69,13 @@ pub const CELL_MAX_WIDTH: f32 = 1024.0;
 const ZOOM_WHEEL_GAIN: f32 = 0.5;
 /// Inner padding between cell border and image area.
 const CELL_PADDING: f32 = 8.0;
-/// Filename strip height inside a tile.
-const STRIP_HEIGHT: f32 = 22.0;
+/// Filename strip height inside a tile: the name line plus the RAW+JPEG
+/// tag line underneath it (empty for unpaired photos, Photo Mechanic-style).
+const STRIP_HEIGHT: f32 = 34.0;
+/// Vertical center of the filename line within the strip.
+const NAME_LINE_CENTER: f32 = 12.0;
+/// Distance from the strip's bottom edge to the tag line's center.
+const TAG_LINE_BOTTOM: f32 = 7.5;
 /// Gap between cells, matching egui's default item spacing we override.
 const GAP: f32 = 8.0;
 /// Maximum characters of a filename shown in a tile before truncation.
@@ -395,13 +400,18 @@ impl GridView {
 
     /// Absolute paths export should copy: the selection when one exists,
     /// otherwise every photo surviving the filter — both in display order,
-    /// so the destination fills in sheet order.
+    /// so the destination fills in sheet order. RAW+JPEG pairs contribute
+    /// both originals back to back (the JPEG right after its RAW).
     pub fn export_set(&self) -> Vec<PathBuf> {
         self.view
             .iter()
             .filter_map(|&row| self.entries.get(row))
             .filter(|entry| self.selection.is_empty() || self.selection.contains(&entry.id))
-            .map(|entry| self.root.join(&entry.rel_path))
+            .flat_map(|entry| {
+                let raw = self.root.join(&entry.rel_path);
+                let jpeg = entry.jpeg_rel_path.as_ref().map(|rel| self.root.join(rel));
+                [raw].into_iter().chain(jpeg)
+            })
             .collect()
     }
 
@@ -1570,10 +1580,13 @@ fn draw_cell(
     draw_image_area(ui, textures, entry, image_area, visible_pending);
     draw_strip(ui.painter(), rect, entry);
 
-    let tooltip = match &entry.err_msg {
-        Some(message) => format!("{}\n⚠ {message}", entry.rel_path.display()),
-        None => entry.rel_path.display().to_string(),
-    };
+    let mut tooltip = entry.rel_path.display().to_string();
+    if let Some(jpeg) = &entry.jpeg_rel_path {
+        tooltip.push_str(&format!("\n+ {}", jpeg.display()));
+    }
+    if let Some(message) = &entry.err_msg {
+        tooltip.push_str(&format!("\n⚠ {message}"));
+    }
     // `on_hover_text` consumes the response, so read the clicks first.
     let hit = CellHit {
         rect,
@@ -1646,8 +1659,10 @@ fn draw_image_area(
     }
 }
 
-/// Bottom strip: color-label dot plus truncated filename that dims while
-/// the photo is still in flight and flags extraction failures.
+/// Bottom strip: color-label dot plus truncated filename on the top line,
+/// and — for RAW+JPEG pairs (SPEC §5.1) — a muted tag line underneath.
+/// The name dims while the photo is still in flight and flags extraction
+/// failures.
 fn draw_strip(painter: &egui::Painter, cell: egui::Rect, entry: &PhotoEntry) {
     let strip = egui::Rect::from_min_max(
         egui::pos2(cell.left(), cell.bottom() - STRIP_HEIGHT),
@@ -1655,9 +1670,10 @@ fn draw_strip(painter: &egui::Painter, cell: egui::Rect, entry: &PhotoEntry) {
     );
     painter.rect_filled(strip, 6.0, theme::BG);
 
+    let name_y = strip.top() + NAME_LINE_CENTER;
     if entry.label != cullr_core::Label::None {
         painter.circle_filled(
-            egui::pos2(strip.left() + 10.0, strip.center().y),
+            egui::pos2(strip.left() + 10.0, name_y),
             3.5,
             theme::label_color(entry.label),
         );
@@ -1679,12 +1695,22 @@ fn draw_strip(painter: &egui::Painter, cell: egui::Rect, entry: &PhotoEntry) {
         strip.left() + 17.0
     };
     painter.text(
-        egui::pos2(name_x, strip.center().y),
+        egui::pos2(name_x, name_y),
         egui::Align2::LEFT_CENTER,
         name,
         egui::FontId::proportional(11.0),
         color,
     );
+
+    if entry.jpeg_rel_path.is_some() {
+        painter.text(
+            egui::pos2(strip.left() + 8.0, strip.bottom() - TAG_LINE_BOTTOM),
+            egui::Align2::LEFT_CENTER,
+            "RAW+JPEG",
+            egui::FontId::proportional(9.0),
+            theme::MUTED,
+        );
+    }
 }
 
 /// Number of whole cells that fit in `width`, accounting for gaps.
@@ -1990,6 +2016,7 @@ mod tests {
             rot_cw: 0,
             thumb_path: None,
             err_msg: None,
+            jpeg_rel_path: None,
         }
     }
 
@@ -2125,6 +2152,7 @@ mod tests {
                 rel_path: format!("IMG_{:04}.CR3", index + 1).into(),
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: index as u64 + 1,
+                jpeg_rel_path: None,
             })
             .collect();
         let entries = db
@@ -2393,6 +2421,23 @@ mod tests {
         let files = grid.export_set();
 
         assert_eq!(files, vec![PathBuf::from("/photos/IMG_0002.CR3")]);
+    }
+
+    #[test]
+    fn export_set_should_copy_the_companion_jpeg_right_after_its_raw() {
+        let mut grid = grid_with(&[TestLabel::None, TestLabel::None]);
+        grid.entries[0].jpeg_rel_path = Some("IMG_0001.JPG".into());
+
+        let files = grid.export_set();
+
+        assert_eq!(
+            files,
+            vec![
+                PathBuf::from("/photos/IMG_0001.CR3"),
+                PathBuf::from("/photos/IMG_0001.JPG"),
+                PathBuf::from("/photos/IMG_0002.CR3"),
+            ]
+        );
     }
 
     #[test]

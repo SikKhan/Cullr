@@ -43,6 +43,7 @@ fn should_extract(path: &Path) {
         rel_path: path.file_name().expect("fixture name").into(),
         mtime: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
         size: metadata.len(),
+        jpeg_rel_path: None,
     };
 
     let info = extract_file(&photo, &cache)
@@ -126,6 +127,7 @@ fn fixtures_should_produce_stable_hashes_across_re_extraction() {
         rel_path: path.file_name().expect("fixture name").into(),
         mtime: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
         size: metadata.len(),
+        jpeg_rel_path: None,
     };
 
     let first = extract_file(&make_photo(), &cache).expect("first pass");
@@ -168,6 +170,7 @@ fn fixture_mtime_change_should_re_key_the_cache() {
         rel_path: path.file_name().expect("fixture name").into(),
         mtime: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
         size: metadata.len(),
+        jpeg_rel_path: None,
     };
 
     let first = extract_file(&base, &cache).expect("base extraction");

@@ -24,6 +24,7 @@ Culling speed comes from embedded JPEG previews, never full RAW decode. The cont
 - Filter chips with live per-label counts; `F` cycles All → Labeled → Unlabeled presets
 - Selection: click, Ctrl-click, Shift-click range, drag marquee; batch labeling with one keystroke
 - Export: copy the originals of your selection (or filtered view) to any folder — bottom-right button or `Ctrl+E`, cross-platform native folder picker
+- RAW+JPEG pairs: folders shot RAW+JPEG show one photo per pair (the RAW, tagged `RAW+JPEG`); exporting copies both files
 - Cell-size zoom slider + Ctrl+wheel (128–1024 px)
 - Sort by filename or taken_at
 - `?` shortcut overlay

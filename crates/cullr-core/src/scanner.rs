@@ -3,7 +3,13 @@
 //!
 //! The scan is intentionally cheap (directory walk + `stat` only) so the grid
 //! can show placeholders immediately while ingest catches up (SPEC §5.1).
+//!
+//! Cameras that write RAW+JPEG pairs (same stem, sibling file) produce one
+//! entry each, not two: the companion JPEG rides on the RAW's
+//! [`PhotoMeta::jpeg_rel_path`] so the sheet shows a single photo and export
+//! can copy both originals.
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
@@ -22,6 +28,11 @@ pub(crate) const EXTENSIONS: &[&[u8]] = &[
     b"iiq", b"kdc", b"mef", b"mrw", b"nef", b"nrw", b"orf", b"pef", b"raf", b"raw", b"rw2", b"rwl",
     b"sr2", b"srw", b"x3f",
 ];
+
+/// Companion-JPEG extensions eligible for RAW+JPEG pairing, lowercase
+/// without dot. JPEGs are never photos of their own here — they only ever
+/// attach to a same-stem RAW in the same directory.
+pub(crate) const JPEG_EXTENSIONS: &[&[u8]] = &[b"jpg", b"jpeg"];
 
 /// Knobs for a folder scan.
 #[derive(Copy, Clone, Debug, Default)]
@@ -52,7 +63,9 @@ pub enum ScanError {
 ///
 /// Hidden files and directories (leading `.`) are skipped in both modes.
 /// Individual unreadable entries are logged and skipped — a partial listing
-/// beats a failed one for culling workflows.
+/// beats a failed one for culling workflows. Sibling JPEGs sharing a stem
+/// with a RAW (case-insensitively, same directory) attach as companions;
+/// unpaired JPEGs are ignored entirely.
 pub fn scan_folder(root: &Path, options: ScanOptions) -> Result<Vec<PhotoMeta>, ScanError> {
     let metadata = root.metadata().map_err(|source| ScanError::Stat {
         path: root.to_owned(),
@@ -63,7 +76,11 @@ pub fn scan_folder(root: &Path, options: ScanOptions) -> Result<Vec<PhotoMeta>, 
     }
 
     let max_depth = if options.recursive { usize::MAX } else { 1 };
-    let mut photos: Vec<PhotoMeta> = WalkDir::new(root)
+    let mut photos: Vec<PhotoMeta> = Vec::new();
+    // Companion candidates keyed by (parent directory, lowercased stem);
+    // several spellings (`a.jpg` + `A.JPEG`) resolve deterministically later.
+    let mut jpegs: HashMap<(PathBuf, String), Vec<PathBuf>> = HashMap::new();
+    for entry in WalkDir::new(root)
         .min_depth(1)
         .max_depth(max_depth)
         .into_iter()
@@ -72,9 +89,33 @@ pub fn scan_folder(root: &Path, options: ScanOptions) -> Result<Vec<PhotoMeta>, 
         .filter_entry(|entry| entry.depth() == 0 || !is_hidden(entry.file_name()))
         .filter_map(handle_entry_error)
         .filter(|entry| entry.file_type().is_file())
-        .filter(|entry| has_raw_extension(entry.file_name()))
-        .filter_map(|entry| to_photo_meta(root, entry))
-        .collect();
+    {
+        let file_name = entry.file_name();
+        if has_raw_extension(file_name) {
+            if let Some(meta) = to_photo_meta(root, entry) {
+                photos.push(meta);
+            }
+        } else if has_jpeg_extension(file_name)
+            && let Some(stem) = lowered_stem(file_name)
+            && let Ok(rel_path) = entry.path().strip_prefix(root)
+        {
+            jpegs
+                .entry((parent_of(rel_path), stem))
+                .or_default()
+                .push(rel_path.to_owned());
+        }
+    }
+
+    for photo in &mut photos {
+        let Some(stem) = lowered_stem(path_file_name(&photo.rel_path)) else {
+            continue;
+        };
+        if let Some(mut candidates) = jpegs.remove(&(parent_of(&photo.rel_path), stem)) {
+            candidates.sort_unstable();
+            photo.jpeg_rel_path = candidates.into_iter().next();
+        }
+    }
+
     photos.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
     Ok(photos)
 }
@@ -94,12 +135,49 @@ fn is_hidden(file_name: &OsStr) -> bool {
     file_name.as_encoded_bytes().first() == Some(&b'.')
 }
 
-fn has_raw_extension(file_name: &OsStr) -> bool {
+/// Bytes after the final dot of a non-empty extension, if any.
+fn extension_bytes(file_name: &OsStr) -> Option<&[u8]> {
     let bytes = file_name.as_encoded_bytes();
-    let Some(dot) = bytes.iter().rposition(|&b| b == b'.') else {
+    let dot = bytes.iter().rposition(|&b| b == b'.')?;
+    Some(&bytes[dot + 1..])
+}
+
+fn has_raw_extension(file_name: &OsStr) -> bool {
+    extension_bytes(file_name).is_some_and(crate::extract::is_supported_extension)
+}
+
+fn has_jpeg_extension(file_name: &OsStr) -> bool {
+    let Some(ext) = extension_bytes(file_name) else {
         return false;
     };
-    crate::extract::is_supported_extension(&bytes[dot + 1..])
+    JPEG_EXTENSIONS
+        .iter()
+        .any(|candidate| ext.eq_ignore_ascii_case(candidate))
+}
+
+/// ASCII-lowercased bytes before the final dot; pairing compares stems
+/// case-insensitively so card-written `IMG_0001.JPG` matches `img_0001.CR3`.
+fn lowered_stem(file_name: &OsStr) -> Option<String> {
+    let bytes = file_name.as_encoded_bytes();
+    let dot = bytes.iter().rposition(|&b| b == b'.')?;
+    let stem: Vec<u8> = bytes[..dot]
+        .iter()
+        .map(|b| b.to_ascii_lowercase())
+        .collect();
+    Some(String::from_utf8_lossy(&stem).into_owned())
+}
+
+/// Parent directory as a map key; top-level files share the empty path.
+fn parent_of(rel_path: &Path) -> PathBuf {
+    rel_path
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .to_owned()
+}
+
+/// A file name that always exists for scanned entries, as bytes.
+fn path_file_name(path: &Path) -> &OsStr {
+    path.file_name().unwrap_or_default()
 }
 
 fn to_photo_meta(root: &Path, entry: DirEntry) -> Option<PhotoMeta> {
@@ -131,6 +209,7 @@ fn to_photo_meta(root: &Path, entry: DirEntry) -> Option<PhotoMeta> {
         rel_path,
         mtime,
         size: metadata.len(),
+        jpeg_rel_path: None,
     })
 }
 
@@ -184,6 +263,110 @@ mod tests {
         let photos = scan_folder(dir.path(), ScanOptions::default()).expect("scan");
 
         assert_eq!(names(&photos), vec!["keep.NEF"]);
+    }
+
+    #[test]
+    fn scan_should_pair_a_sibling_jpeg_onto_its_raw() {
+        let dir = TempDir::new().expect("temp dir");
+        touch(dir.path(), "IMG_0001.CR3");
+        touch(dir.path(), "IMG_0001.JPG");
+
+        let photos = scan_folder(dir.path(), ScanOptions::default()).expect("scan");
+
+        // One copy on the sheet: the JPEG never becomes its own photo.
+        assert_eq!(photos.len(), 1);
+        assert_eq!(names(&photos), vec!["IMG_0001.CR3"]);
+        assert_eq!(
+            photos[0].jpeg_rel_path.as_deref(),
+            Some(Path::new("IMG_0001.JPG"))
+        );
+    }
+
+    #[test]
+    fn scan_should_match_companion_stems_and_extensions_case_insensitively() {
+        let dir = TempDir::new().expect("temp dir");
+        touch(dir.path(), "img_0002.nef");
+        touch(dir.path(), "IMG_0002.JPEG");
+
+        let photos = scan_folder(dir.path(), ScanOptions::default()).expect("scan");
+
+        assert_eq!(
+            photos[0].jpeg_rel_path.as_deref(),
+            Some(Path::new("IMG_0002.JPEG"))
+        );
+    }
+
+    #[test]
+    fn scan_should_leave_raws_without_a_jpeg_companion_alone() {
+        let dir = TempDir::new().expect("temp dir");
+        touch(dir.path(), "a.cr3");
+        touch(dir.path(), "b.arw");
+
+        let photos = scan_folder(dir.path(), ScanOptions::default()).expect("scan");
+
+        assert!(
+            photos.iter().all(|photo| photo.jpeg_rel_path.is_none()),
+            "no siblings means no pairing"
+        );
+    }
+
+    #[test]
+    fn scan_should_ignore_unpaired_jpegs_entirely() {
+        let dir = TempDir::new().expect("temp dir");
+        touch(dir.path(), "solo.jpg");
+        touch(dir.path(), "b.arw");
+
+        let photos = scan_folder(dir.path(), ScanOptions::default()).expect("scan");
+
+        assert_eq!(names(&photos), vec!["b.arw"]);
+        assert_eq!(photos[0].jpeg_rel_path, None);
+    }
+
+    #[test]
+    fn scan_should_not_pair_across_directories_even_recursively() {
+        let dir = TempDir::new().expect("temp dir");
+        fs::create_dir(dir.path().join("sub")).expect("mkdir");
+        touch(dir.path(), "a.cr3");
+        touch(&dir.path().join("sub"), "a.jpg");
+
+        let photos = scan_folder(dir.path(), ScanOptions { recursive: true }).expect("scan");
+
+        assert!(
+            !photos.iter().any(|photo| photo.jpeg_rel_path.is_some()),
+            "companions must be same-directory"
+        );
+    }
+
+    #[test]
+    fn scan_should_pick_a_deterministic_companion_when_several_match() {
+        let dir = TempDir::new().expect("temp dir");
+        touch(dir.path(), "A.CR3");
+        touch(dir.path(), "a.jpeg");
+        touch(dir.path(), "a.jpg");
+
+        let photos = scan_folder(dir.path(), ScanOptions::default()).expect("scan");
+
+        assert_eq!(photos[0].rel_path, Path::new("A.CR3"));
+        // Sorted-path pick, stable across rescans whichever spelling won.
+        assert_eq!(
+            photos[0].jpeg_rel_path.as_deref(),
+            Some(Path::new("a.jpeg"))
+        );
+    }
+
+    #[test]
+    fn scan_should_pair_within_subdirectories_when_recursive() {
+        let dir = TempDir::new().expect("temp dir");
+        fs::create_dir(dir.path().join("day1")).expect("mkdir");
+        touch(&dir.path().join("day1"), "b.orf");
+        touch(&dir.path().join("day1"), "b.JPG");
+
+        let photos = scan_folder(dir.path(), ScanOptions { recursive: true }).expect("scan");
+
+        assert_eq!(
+            photos[0].jpeg_rel_path.as_deref(),
+            Some(Path::new("day1/b.JPG"))
+        );
     }
 
     #[test]

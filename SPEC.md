@@ -75,6 +75,7 @@ CREATE TABLE photos (
   status      INTEGER NOT NULL DEFAULT 0,   -- 0=pending 1=ok 2=error 3=missing
   err_msg TEXT,
   preview_path TEXT, thumb_path TEXT,
+  jpeg_rel_path TEXT,                        -- companion JPEG of a RAW+JPEG pair
   ingested_at INTEGER,
   UNIQUE(root, rel_path));
 CREATE INDEX idx_photos_root  ON photos(root);
@@ -89,6 +90,8 @@ CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);
 
 ### 5.1 Scan (target < 300 ms @ 10k files)
 walkdir (depth 1 default, recursive opt-in) → extension filter = hardcoded list ∩ `rawler::decoders::supported_extensions()` → stat → upsert rows where changed/new → return ordered `Vec<PhotoMeta>` immediately. Grid shows placeholders right away.
+
+RAW+JPEG pairing: a `.jpg`/`.jpeg` sibling with the same stem (case-insensitive, same directory) attaches to the RAW's row (`jpeg_rel_path`) instead of becoming a photo. The sheet shows one copy — the RAW — with a `RAW+JPEG` tag under its filename; export copies both originals. Unpaired JPEGs are ignored; a JPEG appearing/vanishing next to an untouched RAW updates the tag without re-extraction.
 
 ### 5.2 Ingest (per pending file, rayon parallel)
 1. Open → `rawler::get_decoder`
@@ -126,7 +129,7 @@ Views: Home → Grid ⇄ Loupe. Top bar persists in Grid/Loupe.
 | `Enter` / `Esc` | loupe ⇄ grid |
 | `Space` | loupe: fit/100% · grid: enter loupe |
 | `Ctrl+A` / `Shift+A` | select all / none |
-| `Ctrl+E` | export originals: selection, else the filtered view (bottom-right button) |
+| `Ctrl+E` | export originals: selection, else the filtered view (bottom-right button); RAW+JPEG pairs copy both files |
 | `F` | cycle filter preset: All → Labeled → Unlabeled |
 | `?` | shortcut overlay |
 
