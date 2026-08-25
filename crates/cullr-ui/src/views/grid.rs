@@ -888,7 +888,16 @@ impl GridView {
                             } else {
                                 format!("Export {}", widgets::grouped(self.selection.len()))
                             };
-                            let response = ui.add_enabled(!exporting, egui::Button::new(label));
+                            // Primary action of the sheet, styled like the
+                            // Home screen's picker button.
+                            let response = ui.add_enabled(
+                                !exporting,
+                                egui::Button::new(
+                                    egui::RichText::new(label).size(15.0).color(theme::BG),
+                                )
+                                .min_size(egui::vec2(132.0, 32.0))
+                                .fill(theme::ACCENT),
+                            );
                             let hint = if exporting {
                                 "Copying originals…"
                             } else if self.selection.is_empty() {

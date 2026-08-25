@@ -103,6 +103,21 @@ pub fn export_files(
     Ok(report)
 }
 
+/// Names from `sources` that already exist as entries in `dest_dir`, in
+/// input order without duplicates. Purely advisory — lets the UI warn
+/// before [`export_files`] overwrites them (`cp` semantics).
+pub fn existing_names(sources: &[PathBuf], dest_dir: &Path) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut existing = Vec::new();
+    for name in sources.iter().filter_map(|source| source.file_name()) {
+        let name = name.to_string_lossy().into_owned();
+        if seen.insert(name.clone()) && dest_dir.join(&name).exists() {
+            existing.push(name);
+        }
+    }
+    existing
+}
+
 /// Copies one file, appending either a success or a failure to `report`.
 fn copy_one(source: &Path, dest_dir: &Path, report: &mut ExportReport) {
     let Some(name) = source.file_name() else {
@@ -270,6 +285,47 @@ mod tests {
 
         assert_eq!(ticks, vec![1, 2]);
         assert_eq!(report.processed(), 2);
+    }
+
+    #[test]
+    fn existing_names_should_list_only_sources_already_in_the_destination() {
+        let src = TempDir::new().expect("temp dir");
+        let dest = TempDir::new().expect("temp dir");
+        let fresh = touch(src.path(), "fresh.nef", b"f");
+        let clash = touch(src.path(), "clash.nef", b"c");
+
+        let names = existing_names(&[fresh.clone(), clash.clone()], dest.path());
+
+        assert!(
+            names.is_empty(),
+            "nothing in dest yet, nothing to warn about"
+        );
+
+        std::fs::write(dest.path().join("clash.nef"), b"old").expect("fixture write");
+        let names = existing_names(&[fresh, clash], dest.path());
+        assert_eq!(names, vec!["clash.nef".to_owned()]);
+    }
+
+    #[test]
+    fn existing_names_should_deduplicate_repeated_source_names() {
+        let src = TempDir::new().expect("temp dir");
+        let other = TempDir::new().expect("temp dir");
+        let dest = TempDir::new().expect("temp dir");
+        let a = touch(src.path(), "a.nef", b"a");
+        let same_name = touch(other.path(), "a.nef", b"different bytes");
+        let b = touch(src.path(), "b.nef", b"b");
+
+        let names = existing_names(&[a.clone(), same_name.clone(), b.clone()], dest.path());
+        assert!(names.is_empty(), "empty destination, nothing to warn about");
+
+        std::fs::write(dest.path().join("a.nef"), b"old").expect("fixture write");
+        std::fs::write(dest.path().join("b.nef"), b"old").expect("fixture write");
+        let names = existing_names(&[a, same_name, b], dest.path());
+        assert_eq!(
+            names,
+            vec!["a.nef".to_owned(), "b.nef".to_owned()],
+            "two sources sharing a name warn once"
+        );
     }
 
     #[test]

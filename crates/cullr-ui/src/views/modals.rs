@@ -148,8 +148,9 @@ fn is_question_event(event: &egui::Event) -> bool {
 /// Shared modal chrome: full-screen dimmed backdrop plus a centered
 /// rounded panel built by `content` (returning `true` for an explicit
 /// close request, e.g. a Close button). Returns `true` when the dialog
-/// should dismiss — backdrop click or the panel's own close.
-fn draw_dialog(
+/// should dismiss — backdrop click or the panel's own close. Also hosts
+/// the app shell's export confirmation (`app.rs`).
+pub(crate) fn draw_dialog(
     ctx: &egui::Context,
     id: egui::Id,
     content: impl FnOnce(&mut egui::Ui) -> bool,

@@ -23,6 +23,7 @@ use crate::tex::Textures;
 use crate::views::Action;
 use crate::views::grid::GridView;
 use crate::views::home::HomeView;
+use crate::views::modals;
 use crate::views::modals::Modals;
 use crate::views::widgets;
 
@@ -64,6 +65,19 @@ struct ExportJob {
     cancel: Arc<AtomicBool>,
 }
 
+/// Export queued behind an overwrite confirmation: the picked destination
+/// already holds files with these names, and exporting replaces them.
+struct PendingExport {
+    /// Folder the exported files were scanned from.
+    root: PathBuf,
+    /// Absolute paths of the originals to copy.
+    files: Vec<PathBuf>,
+    /// User-picked destination folder.
+    dest: PathBuf,
+    /// Source file names already present in `dest`.
+    duplicates: Vec<String>,
+}
+
 /// Which screen is currently mounted. The grid state is boxed: it is by
 /// far the largest variant and swapping screens must stay cheap.
 enum Screen {
@@ -94,6 +108,9 @@ pub struct App {
     modals: Modals,
     /// Export run in flight, if any; cancelled when the folder changes.
     export_job: Option<ExportJob>,
+    /// Export waiting for the user to confirm overwriting duplicates in
+    /// the picked destination folder, if any.
+    pending_export: Option<PendingExport>,
 }
 
 impl App {
@@ -127,6 +144,7 @@ impl App {
             textures: Textures::new(),
             modals: Modals::default(),
             export_job: None,
+            pending_export: None,
         }
     }
 
@@ -147,6 +165,7 @@ impl App {
             pipeline.cancel();
         }
         self.cancel_export();
+        self.pending_export = None;
         self.scanning = Some(root.clone());
         let auto_advance = widgets::load_auto_advance(&self.db);
         self.screen = Screen::Grid(Box::new(GridView::new(root.clone(), auto_advance)));
@@ -315,27 +334,20 @@ impl App {
                 let Some(dest) = rfd::FileDialog::new().pick_folder() else {
                     return;
                 };
-                let total = files.len();
-                let cancel = Arc::new(AtomicBool::new(false));
-                self.export_job = Some(ExportJob {
-                    root: root.clone(),
-                    cancel: Arc::clone(&cancel),
-                });
-                if let Screen::Grid(grid) = &mut self.screen {
-                    grid.begin_export(total);
+                // `export_files` overwrites like `cp`; pause for a
+                // confirmation when that would silently replace files
+                // already sitting in the destination.
+                let duplicates = cullr_core::existing_names(&files, &dest);
+                if duplicates.is_empty() {
+                    self.start_export(root, files, dest);
+                } else {
+                    self.pending_export = Some(PendingExport {
+                        root,
+                        files,
+                        dest,
+                        duplicates,
+                    });
                 }
-                let sender = self.events_tx.clone();
-                tracing::info!(count = total, ?root, ?dest, "export started");
-                std::thread::spawn(move || {
-                    let result = cullr_core::export_files(&files, &dest, &cancel, |done| {
-                        let _sent = sender.send(Event::ExportProgress {
-                            root: root.clone(),
-                            done,
-                        });
-                    })
-                    .map_err(|error| error.to_string());
-                    let _sent = sender.send(Event::ExportFinished { root, result });
-                });
             }
             Some(Action::BackToHome) => {
                 self.scanning = None;
@@ -346,6 +358,123 @@ impl App {
                 self.screen = Screen::Home(HomeView);
             }
             Some(Action::ShowAbout) => self.modals.open_about(),
+        }
+    }
+
+    /// Launches a copy run for an already-picked destination: registers
+    /// the job, flips the grid into progress mode and spawns the worker.
+    fn start_export(&mut self, root: PathBuf, files: Vec<PathBuf>, dest: PathBuf) {
+        let total = files.len();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.export_job = Some(ExportJob {
+            root: root.clone(),
+            cancel: Arc::clone(&cancel),
+        });
+        if let Screen::Grid(grid) = &mut self.screen {
+            grid.begin_export(total);
+        }
+        let sender = self.events_tx.clone();
+        tracing::info!(count = total, ?root, ?dest, "export started");
+        std::thread::spawn(move || {
+            let result = cullr_core::export_files(&files, &dest, &cancel, |done| {
+                let _sent = sender.send(Event::ExportProgress {
+                    root: root.clone(),
+                    done,
+                });
+            })
+            .map_err(|error| error.to_string());
+            let _sent = sender.send(Event::ExportFinished { root, result });
+        });
+    }
+
+    /// Draws the overwrite-confirmation dialog while an export is pending
+    /// and resolves its outcome: confirming (button or Enter) starts the
+    /// copy run; dismissing (Cancel button, Esc or backdrop click) drops it.
+    /// Runs after the screens so the chrome paints on top of everything,
+    /// mirroring [`Modals::draw`].
+    fn pump_export_confirm(&mut self, ctx: &egui::Context) {
+        use crate::theme::{ACCENT, BG, MUTED, TEXT};
+
+        let Some(pending) = self.pending_export.as_ref() else {
+            return;
+        };
+        let (escape, enter) = ctx.input(|input| {
+            (
+                input.key_pressed(egui::Key::Escape),
+                input.key_pressed(egui::Key::Enter),
+            )
+        });
+        let folder_name = pending.dest.file_name().map_or_else(
+            || pending.dest.to_string_lossy().into_owned(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        let count = pending.duplicates.len();
+        let names_preview = match count {
+            0..=4 => pending.duplicates.join(", "),
+            _ => format!(
+                "{}, … and {} more",
+                pending.duplicates[..4].join(", "),
+                count - 4
+            ),
+        };
+        let noun = if count == 1 { "file" } else { "files" };
+
+        let mut confirmed = false;
+        let dismissed = modals::draw_dialog(ctx, egui::Id::new("cullr_export_confirm"), |ui| {
+            ui.label(
+                egui::RichText::new("Overwrite existing files?")
+                    .heading()
+                    .strong()
+                    .color(TEXT),
+            );
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("The folder").color(TEXT));
+                ui.label(egui::RichText::new(folder_name).strong().color(ACCENT));
+                ui.label(
+                    egui::RichText::new(format!(
+                        "already contains {count} {noun} with these names:"
+                    ))
+                    .color(TEXT),
+                );
+            });
+            ui.label(egui::RichText::new(names_preview).color(MUTED));
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(format!(
+                    "Exporting will overwrite them with your copies of these {noun}."
+                ))
+                .color(TEXT),
+            );
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(8.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new(format!("Overwrite {count} {noun}")).color(BG),
+                        )
+                        .fill(ACCENT),
+                    )
+                    .clicked()
+                {
+                    confirmed = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    return true;
+                }
+                false
+            })
+            .inner
+        });
+
+        if confirmed || enter {
+            if let Some(job) = self.pending_export.take() {
+                self.start_export(job.root, job.files, job.dest);
+            }
+        } else if escape || dismissed {
+            self.pending_export = None;
         }
     }
 }
@@ -359,9 +488,10 @@ impl eframe::App for App {
         self.drain_events();
         // Modal open/close intents are read before the views so a closing
         // keypress never falls through into the screen underneath; while
-        // a modal is up the views render but stay input-suspended.
+        // a modal or the export confirmation is up the views render but
+        // stay input-suspended.
         self.modals.pump_input(&ctx);
-        let suspended = self.modals.any();
+        let suspended = self.modals.any() || self.pending_export.is_some();
 
         match &mut self.screen {
             Screen::Home(home) => {
@@ -383,7 +513,8 @@ impl eframe::App for App {
         }
 
         // Dialogs paint last so they sit above every layer the screens
-        // created this frame (SPEC §6 `?` overlay, About).
+        // created this frame (SPEC §6 `?` overlay, About, export confirm).
+        self.pump_export_confirm(&ctx);
         self.modals.draw(&ctx);
 
         self.pump_priority();
