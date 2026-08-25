@@ -39,3 +39,11 @@ needless_collect = "deny"
 
 [profile.release]
 lto = "thin"
+
+# Dev builds stay unoptimized for fast iteration, but the heavy lifting is
+# all in dependencies (JPEG decode, RAW extraction): left at opt-level 0,
+# one 1920x1280 loupe decode takes ~1 s and preview browsing is unusable.
+# Optimizing just the dependency tree keeps workspace compile times low
+# while making `cargo run` usable for real culling sessions.
+[profile.dev.package."*"]
+opt-level = 2
