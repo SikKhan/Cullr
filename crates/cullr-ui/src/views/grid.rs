@@ -47,6 +47,7 @@ use super::Action;
 use super::loupe;
 use super::widgets;
 use super::widgets::CHIP_HEIGHT;
+use super::widgets::ExportMode;
 use super::widgets::FilterChip;
 use super::widgets::LabelFilter;
 use super::widgets::SortKey;
@@ -101,6 +102,15 @@ const NAV_KEYS: [egui::Key; 4] = [
 /// press-and-release stays a click (SPEC §6 selection). Matches egui's
 /// own click slop so the two never disagree.
 const MARQUEE_MIN_DRAG: f32 = 6.0;
+/// Width of the export pill's main button; the primary action of the
+/// sheet, styled like the Home screen's picker button.
+const EXPORT_BUTTON_WIDTH: f32 = 132.0;
+/// Height of both export pill segments. Also seeds the pill's horizontal
+/// row (see [`GridView::draw_export_control`]) so the run-note text sits
+/// on the button's centerline instead of egui's default 18 pt band.
+const EXPORT_BUTTON_HEIGHT: f32 = 32.0;
+/// Width of the export pill's scope-menu chevron segment.
+const EXPORT_CHEVRON_WIDTH: f32 = 22.0;
 
 /// Cell metrics for one frame: everything about tile layout derives from
 /// the zoomable width, so the slider and wheel change one number here and
@@ -217,6 +227,13 @@ pub struct GridView {
     /// Summary of the last finished export, shown beside the button until
     /// the next run or folder change retires it.
     export_note: Option<ExportNote>,
+    /// Which side of RAW+JPEG pairs exports copy (SPEC §6 export); a
+    /// persisted preference loaded per folder mount (SPEC §4 kv store).
+    export_mode: ExportMode,
+    /// Export mode queued by a scope-menu pick this frame, applied after
+    /// the bars are drawn — persistence needs the db handle from `ui`,
+    /// exactly like [`Self::pending_sort`].
+    pending_mode: Option<ExportMode>,
 }
 
 /// Finished-export summary pill content beside the export button.
@@ -238,8 +255,8 @@ struct OpenRequest {
 impl GridView {
     /// Creates the view in its scanning state; contents arrive later via
     /// [`Self::apply_scan`] (SPEC §5.1 placeholders-first). `auto_advance`
-    /// arrives pre-loaded from the persisted kv setting.
-    pub fn new(root: PathBuf, auto_advance: bool) -> Self {
+    /// and `export_mode` arrive pre-loaded from the persisted kv settings.
+    pub fn new(root: PathBuf, auto_advance: bool, export_mode: ExportMode) -> Self {
         Self {
             root,
             entries: Vec::new(),
@@ -271,6 +288,8 @@ impl GridView {
             export_done: 0,
             export_total: 0,
             export_note: None,
+            export_mode,
+            pending_mode: None,
         }
     }
 
@@ -413,19 +432,38 @@ impl GridView {
 
     /// Absolute paths export should copy: the selection when one exists,
     /// otherwise every photo surviving the filter — both in display order,
-    /// so the destination fills in sheet order. RAW+JPEG pairs contribute
-    /// both originals back to back (the JPEG right after its RAW).
-    pub fn export_set(&self) -> Vec<PathBuf> {
+    /// so the destination fills in sheet order. [`ExportMode::All`] emits
+    /// RAW+JPEG pairs back to back (the JPEG right after its RAW); the
+    /// narrower modes copy just one side of each pair, and photos without
+    /// a companion contribute nothing when JPEGs were requested.
+    pub fn export_set(&self, mode: ExportMode) -> Vec<PathBuf> {
+        let want_raw = matches!(mode, ExportMode::All | ExportMode::RawOnly);
+        let want_jpeg = matches!(mode, ExportMode::All | ExportMode::JpegOnly);
         self.view
             .iter()
             .filter_map(|&row| self.entries.get(row))
             .filter(|entry| self.selection.is_empty() || self.selection.contains(&entry.id))
             .flat_map(|entry| {
-                let raw = self.root.join(&entry.rel_path);
-                let jpeg = entry.jpeg_rel_path.as_ref().map(|rel| self.root.join(rel));
-                [raw].into_iter().chain(jpeg)
+                let raw = want_raw.then(|| self.root.join(&entry.rel_path));
+                let jpeg = want_jpeg
+                    .then(|| entry.jpeg_rel_path.as_ref().map(|rel| self.root.join(rel)))
+                    .flatten();
+                raw.into_iter().chain(jpeg)
             })
             .collect()
+    }
+
+    /// Photos in the current export scope — selection first, filtered view
+    /// otherwise — that contribute at least one file under `mode`. Drives
+    /// the pill's count and its zero-files guard; every photo has a RAW,
+    /// so only JPEG mode narrows to paired photos.
+    fn export_count(&self, mode: ExportMode) -> usize {
+        self.view
+            .iter()
+            .filter_map(|&row| self.entries.get(row))
+            .filter(|entry| self.selection.is_empty() || self.selection.contains(&entry.id))
+            .filter(|entry| mode != ExportMode::JpegOnly || entry.jpeg_rel_path.is_some())
+            .count()
     }
 
     /// Hands the app the latest changed set of visible pending photos for
@@ -497,7 +535,8 @@ impl GridView {
             (false, false)
         };
         // Export shortcut mirrors the bottom-right button; the scope is
-        // computed at press time exactly like a click would compute it.
+        // computed at press time exactly like a click would compute it,
+        // under the mode currently picked in the pill's scope menu.
         let export_key = sheet_keys
             && ui
                 .ctx()
@@ -512,7 +551,7 @@ impl GridView {
             action = Some(Action::BackToHome);
         }
         if export_key && !self.is_exporting() {
-            let files = self.export_set();
+            let files = self.export_set(self.export_mode);
             if !files.is_empty() {
                 action = Some(Action::Export {
                     root: self.root.clone(),
@@ -593,6 +632,13 @@ impl GridView {
                 self.refresh_taken_at(db);
             }
             self.apply_order_change();
+        }
+
+        // An export scope picked in the pill's menu applies here for the
+        // same reason: persisting it needs the db handle.
+        if let Some(mode) = self.pending_mode.take() {
+            self.export_mode = mode;
+            widgets::store_export_mode(db, mode);
         }
 
         action
@@ -902,12 +948,15 @@ impl GridView {
         }
     }
 
-    /// Floating export control: a pill anchored to the viewport's bottom-
-    /// right corner carrying the run progress / last-run note and the
-    /// button itself. Returns the export action when clicked. The scope
-    /// (selection first, filtered view otherwise) is resolved only on
-    /// click so relabeling never costs anything per frame.
-    fn draw_export_control(&self, ctx: &egui::Context) -> Option<Action> {
+    /// Floating export control: a split pill anchored to the viewport's
+    /// bottom-right corner carrying the run progress / last-run note, the
+    /// export button itself and a chevron opening the scope menu upward
+    /// ([`ExportMode`]: all files / RAW only / JPEG only). Returns the
+    /// export action when the main segment is clicked; a menu pick queues
+    /// [`Self::pending_mode`] instead. The file set (selection first,
+    /// filtered view otherwise) is resolved only on click so relabeling
+    /// never costs anything per frame.
+    fn draw_export_control(&mut self, ctx: &egui::Context) -> Option<Action> {
         let mut picked = None;
         egui::Area::new(egui::Id::new("cullr_export_control"))
             .order(egui::Order::Foreground)
@@ -919,41 +968,87 @@ impl GridView {
                     .stroke(egui::Stroke::new(1.0, theme::MUTED.gamma_multiply(0.35)))
                     .inner_margin(egui::Margin::symmetric(10, 6))
                     .show(ui, |ui| {
+                        // egui seeds a fresh horizontal row's height from
+                        // `interact_size.y` (~18 pt): the note centers inside
+                        // that band while this taller button expands downward
+                        // from the row top, leaving the text riding above the
+                        // button's centerline. Seeding the row with the
+                        // button's own height puts everything on one line.
+                        ui.spacing_mut().interact_size.y = EXPORT_BUTTON_HEIGHT;
                         ui.horizontal(|ui| {
                             if let Some(note) = &self.export_note {
                                 ui.label(egui::RichText::new(&note.text).color(note.color));
                             }
                             let exporting = self.is_exporting();
+                            let mode = self.export_mode;
+                            let count = self.export_count(mode);
                             let label = if exporting {
                                 format!(
                                     "Exporting {} / {}…",
                                     widgets::grouped(self.export_done.min(self.export_total)),
                                     widgets::grouped(self.export_total)
                                 )
-                            } else if self.selection.is_empty() {
-                                format!("Export {}", widgets::grouped(self.view.len()))
                             } else {
-                                format!("Export {}", widgets::grouped(self.selection.len()))
+                                match mode {
+                                    ExportMode::All => {
+                                        format!("Export {}", widgets::grouped(count))
+                                    }
+                                    ExportMode::RawOnly => {
+                                        format!("Export {} RAW", widgets::grouped(count))
+                                    }
+                                    ExportMode::JpegOnly => {
+                                        format!("Export {} JPEG", widgets::grouped(count))
+                                    }
+                                }
                             };
                             // Primary action of the sheet, styled like the
-                            // Home screen's picker button.
+                            // Home screen's picker button; asleep while a run
+                            // is in flight or the current scope holds nothing.
                             let response = ui.add_enabled(
-                                !exporting,
+                                !exporting && count > 0,
                                 egui::Button::new(
                                     egui::RichText::new(label).size(15.0).color(theme::BG),
                                 )
-                                .min_size(egui::vec2(132.0, 32.0))
-                                .fill(theme::ACCENT),
+                                .min_size(egui::vec2(EXPORT_BUTTON_WIDTH, EXPORT_BUTTON_HEIGHT))
+                                .fill(theme::ACCENT)
+                                // Square facing edge so both segments read
+                                // as one rounded pill.
+                                .corner_radius(
+                                    egui::CornerRadius {
+                                        nw: 6,
+                                        ne: 0,
+                                        sw: 6,
+                                        se: 0,
+                                    },
+                                ),
                             );
+                            let main_rect = response.rect;
                             let hint = if exporting {
-                                "Copying originals…"
-                            } else if self.selection.is_empty() {
-                                "Copy these photos' original files to another folder — Ctrl+E"
+                                "Copying originals…".to_owned()
+                            } else if count == 0 {
+                                "None of these photos has a companion JPEG — pick another \
+                                 scope from the ▾ menu"
+                                    .to_owned()
                             } else {
-                                "Copy the selected photos' original files to another folder — Ctrl+E"
+                                let subject = if self.selection.is_empty() {
+                                    "these photos"
+                                } else {
+                                    "the selected photos"
+                                };
+                                match mode {
+                                    ExportMode::All => format!(
+                                        "Copy {subject}' original files to another folder — Ctrl+E"
+                                    ),
+                                    ExportMode::RawOnly => {
+                                        format!("Copy just the RAW originals of {subject} — Ctrl+E")
+                                    }
+                                    ExportMode::JpegOnly => format!(
+                                        "Copy just the companion JPEGs of {subject} — Ctrl+E"
+                                    ),
+                                }
                             };
                             if response.on_hover_text(hint).clicked() {
-                                let files = self.export_set();
+                                let files = self.export_set(mode);
                                 if !files.is_empty() {
                                     picked = Some(Action::Export {
                                         root: self.root.clone(),
@@ -961,6 +1056,54 @@ impl GridView {
                                     });
                                 }
                             }
+                            // The two segments sit flush, parted by a
+                            // hairline painted below once both rects exist.
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            let chevron_response = ui.add_enabled(
+                                !exporting,
+                                egui::Button::new(
+                                    egui::RichText::new("▾").size(13.0).color(theme::BG),
+                                )
+                                .min_size(egui::vec2(EXPORT_CHEVRON_WIDTH, EXPORT_BUTTON_HEIGHT))
+                                .fill(theme::ACCENT)
+                                .corner_radius(
+                                    egui::CornerRadius {
+                                        nw: 0,
+                                        ne: 6,
+                                        sw: 0,
+                                        se: 6,
+                                    },
+                                ),
+                            );
+                            let chevron_rect = chevron_response.rect;
+                            let chevron_hint =
+                                "Choose what export copies — all files, RAW only, or JPEG only";
+                            // Opens upward because the pill hugs the bottom
+                            // edge of the window.
+                            egui::Popup::menu(&chevron_response.on_hover_text(chevron_hint))
+                                .align(egui::RectAlign::TOP_END)
+                                .show(|ui| {
+                                    for candidate in
+                                        [ExportMode::All, ExportMode::RawOnly, ExportMode::JpegOnly]
+                                    {
+                                        if ui
+                                            .selectable_label(
+                                                candidate == mode,
+                                                format!("Export {}", candidate.label()),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.pending_mode = Some(candidate);
+                                        }
+                                    }
+                                });
+                            ui.painter().line_segment(
+                                [
+                                    egui::pos2(chevron_rect.left(), main_rect.top() + 4.0),
+                                    egui::pos2(chevron_rect.left(), main_rect.bottom() - 4.0),
+                                ],
+                                egui::Stroke::new(1.0, theme::BG),
+                            );
                         });
                     });
             });
@@ -2085,7 +2228,7 @@ mod tests {
     }
 
     fn grid_with(labels: &[TestLabel]) -> GridView {
-        let mut grid = GridView::new("/photos".into(), false);
+        let mut grid = GridView::new("/photos".into(), false, ExportMode::All);
         let entries = labels
             .iter()
             .enumerate()
@@ -2149,7 +2292,7 @@ mod tests {
 
     #[test]
     fn jump_next_error_should_find_errors_after_the_cursor_then_wrap() {
-        let mut grid = GridView::new("/photos".into(), false);
+        let mut grid = GridView::new("/photos".into(), false, ExportMode::All);
         let entries = vec![
             entry_at(1, TestLabel::None),
             entry_at(2, TestLabel::None),
@@ -2222,7 +2365,7 @@ mod tests {
         let entries = db
             .sync_scan(root, &scanned, cullr_core::ScanOptions::default())
             .expect("sync");
-        let mut grid = GridView::new(root.to_owned(), false);
+        let mut grid = GridView::new(root.to_owned(), false, ExportMode::All);
         grid.apply_scan(Ok(entries));
         grid
     }
@@ -2449,7 +2592,7 @@ mod tests {
         grid.selection.insert(PhotoId(1));
         grid.selection.insert(PhotoId(3));
 
-        let files = grid.export_set();
+        let files = grid.export_set(ExportMode::All);
 
         assert_eq!(
             files,
@@ -2467,7 +2610,7 @@ mod tests {
         grid.apply_order_change();
         assert!(grid.selection.is_empty());
 
-        let files = grid.export_set();
+        let files = grid.export_set(ExportMode::All);
 
         assert_eq!(files, vec![PathBuf::from("/photos/IMG_0002.CR3")]);
     }
@@ -2482,7 +2625,7 @@ mod tests {
         grid.filter.toggle(TestLabel::None);
         grid.apply_order_change();
 
-        let files = grid.export_set();
+        let files = grid.export_set(ExportMode::All);
 
         assert_eq!(files, vec![PathBuf::from("/photos/IMG_0002.CR3")]);
     }
@@ -2492,7 +2635,7 @@ mod tests {
         let mut grid = grid_with(&[TestLabel::None, TestLabel::None]);
         grid.entries[0].jpeg_rel_path = Some("IMG_0001.JPG".into());
 
-        let files = grid.export_set();
+        let files = grid.export_set(ExportMode::All);
 
         assert_eq!(
             files,
@@ -2502,6 +2645,44 @@ mod tests {
                 PathBuf::from("/photos/IMG_0002.CR3"),
             ]
         );
+    }
+
+    #[test]
+    fn export_set_raw_only_should_drop_companion_jpegs() {
+        let mut grid = grid_with(&[TestLabel::None, TestLabel::None]);
+        grid.entries[0].jpeg_rel_path = Some("IMG_0001.JPG".into());
+        grid.select_all();
+
+        let files = grid.export_set(ExportMode::RawOnly);
+
+        assert_eq!(
+            files,
+            vec![
+                PathBuf::from("/photos/IMG_0001.CR3"),
+                PathBuf::from("/photos/IMG_0002.CR3"),
+            ]
+        );
+    }
+
+    #[test]
+    fn export_set_jpeg_only_should_copy_pairs_and_skip_unpaired_photos() {
+        let mut grid = grid_with(&[TestLabel::None, TestLabel::None]);
+        grid.entries[0].jpeg_rel_path = Some("IMG_0001.JPG".into());
+        grid.select_all();
+
+        let files = grid.export_set(ExportMode::JpegOnly);
+
+        assert_eq!(
+            files,
+            vec![PathBuf::from("/photos/IMG_0001.JPG")],
+            "a photo without a companion JPEG contributes nothing"
+        );
+
+        // The count mirrors the file set so the pill never promises
+        // more than the run would copy.
+        assert_eq!(grid.export_count(ExportMode::JpegOnly), 1);
+        assert_eq!(grid.export_count(ExportMode::RawOnly), 2);
+        assert_eq!(grid.export_count(ExportMode::All), 2);
     }
 
     #[test]
@@ -2827,7 +3008,7 @@ mod tests {
         let entries: Vec<PhotoEntry> = (0..count)
             .map(|index| entry_at(first_id + index as u64, TestLabel::None))
             .collect();
-        let mut grid = GridView::new("/photos".into(), false);
+        let mut grid = GridView::new("/photos".into(), false, ExportMode::All);
         grid.apply_scan(Ok(entries));
         grid
     }

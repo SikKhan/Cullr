@@ -168,7 +168,12 @@ impl App {
         self.pending_export = None;
         self.scanning = Some(root.clone());
         let auto_advance = widgets::load_auto_advance(&self.db);
-        self.screen = Screen::Grid(Box::new(GridView::new(root.clone(), auto_advance)));
+        let export_mode = widgets::load_export_mode(&self.db);
+        self.screen = Screen::Grid(Box::new(GridView::new(
+            root.clone(),
+            auto_advance,
+            export_mode,
+        )));
         let db = Arc::clone(&self.db);
         let sender = self.events_tx.clone();
         // Scan is a cheap walk + tiny upserts (< 300 ms @ 10k per SPEC §8);

@@ -16,6 +16,9 @@ use crate::theme;
 /// kv row backing the auto-advance toggle so it survives restarts.
 const AUTO_ADVANCE_KEY: &str = "auto_advance";
 
+/// kv row backing the export mode so it survives restarts.
+const EXPORT_MODE_KEY: &str = "export_mode";
+
 /// Bit for [`Label::None`] inside [`LabelFilter::mask`].
 const UNLABELED_BIT: u8 = 1;
 /// Bitmask selecting every colored label (`Red..=Purple`).
@@ -132,6 +135,52 @@ impl SortKey {
         match self {
             Self::FileName => "filename",
             Self::TakenAt => "capture time",
+        }
+    }
+}
+
+/// Which side of RAW+JPEG pairs an export copies (SPEC §6 export).
+///
+/// Pure data so the grid can scope [`crate::views::grid::GridView`]'s
+/// file set and the export pill can render the choice; the core's
+/// `export_files` stays agnostic and copies whatever list it is given.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExportMode {
+    /// The RAW plus its companion JPEG, back to back.
+    #[default]
+    All,
+    /// Only the RAW originals; companion JPEGs stay behind.
+    RawOnly,
+    /// Only companion JPEGs; photos without one contribute nothing.
+    JpegOnly,
+}
+
+impl ExportMode {
+    /// Human name shown inside the export scope menu.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "all files",
+            Self::RawOnly => "RAW only",
+            Self::JpegOnly => "JPEG only",
+        }
+    }
+
+    /// Parses the persisted kv representation, rejecting unknown values.
+    pub fn from_kv(value: &str) -> Option<Self> {
+        match value {
+            "all" => Some(Self::All),
+            "raw" => Some(Self::RawOnly),
+            "jpeg" => Some(Self::JpegOnly),
+            _ => None,
+        }
+    }
+
+    /// The persisted kv representation of this mode.
+    pub fn to_kv(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::RawOnly => "raw",
+            Self::JpegOnly => "jpeg",
         }
     }
 }
@@ -421,6 +470,29 @@ pub fn store_auto_advance(db: &Db, enabled: bool) {
     }
 }
 
+/// Loads the persisted export mode, defaulting to all-files: copying
+/// both sides of every pair is the loss-free choice, so narrowing is
+/// always an explicit act. Read failures degrade to the default rather
+/// than blocking startup.
+pub fn load_export_mode(db: &Db) -> ExportMode {
+    match db.kv_get(EXPORT_MODE_KEY) {
+        Ok(Some(value)) => ExportMode::from_kv(&value).unwrap_or_default(),
+        Ok(None) => ExportMode::default(),
+        Err(error) => {
+            tracing::warn!(%error, "cannot read export mode setting");
+            ExportMode::default()
+        }
+    }
+}
+
+/// Persists the export mode; failures are logged and otherwise ignored
+/// because the in-memory state already drives the UI.
+pub fn store_export_mode(db: &Db, mode: ExportMode) {
+    if let Err(error) = db.kv_set(EXPORT_MODE_KEY, mode.to_kv()) {
+        tracing::warn!(%error, "cannot persist export mode");
+    }
+}
+
 /// Draws the label palette as digit-tagged dots and reports a clicked
 /// label. The active label gets a bright fill plus an outer ring; others
 /// stay dimmed but legible so the whole mapping remains readable.
@@ -531,6 +603,44 @@ mod tests {
         store_auto_advance(&db, true);
 
         assert!(load_auto_advance(&db));
+    }
+
+    #[test]
+    fn load_export_mode_should_default_to_all_and_round_trip() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = Db::open(&dir.path().join("index.db")).expect("open db");
+
+        assert_eq!(
+            load_export_mode(&db),
+            ExportMode::All,
+            "unset key defaults to all files"
+        );
+
+        store_export_mode(&db, ExportMode::JpegOnly);
+
+        assert_eq!(load_export_mode(&db), ExportMode::JpegOnly);
+
+        store_export_mode(&db, ExportMode::RawOnly);
+
+        assert_eq!(load_export_mode(&db), ExportMode::RawOnly);
+    }
+
+    #[test]
+    fn load_export_mode_should_degrade_to_all_on_unknown_values() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = Db::open(&dir.path().join("index.db")).expect("open db");
+
+        db.kv_set(EXPORT_MODE_KEY, "bogus").expect("write kv");
+
+        assert_eq!(load_export_mode(&db), ExportMode::All);
+    }
+
+    #[test]
+    fn export_mode_kv_should_round_trip_every_variant() {
+        for mode in [ExportMode::All, ExportMode::RawOnly, ExportMode::JpegOnly] {
+            assert_eq!(ExportMode::from_kv(mode.to_kv()), Some(mode));
+        }
+        assert_eq!(ExportMode::from_kv("nope"), None);
     }
 
     #[test]
