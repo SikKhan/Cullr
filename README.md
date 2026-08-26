@@ -1,5 +1,8 @@
 # Cullr
 
+[![Release](https://img.shields.io/github/v/release/SikKhan/Cullr)](https://github.com/SikKhan/Cullr/releases/latest)
+[![CI](https://github.com/SikKhan/Cullr/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/SikKhan/Cullr/actions/workflows/ci.yml)
+
 Photo Mechanic-style culling for RAW photographs. 
 Open a folder, browse embedded JPEG previews instantly, mark colors, filter. Keyboard-first.
 
@@ -34,7 +37,14 @@ Open a folder, browse embedded JPEG previews instantly, mark colors, filter. Key
 
 ## Install & build
 
-Prerequisites: Rust 1.85+.
+**Download:** grab the pre-built Linux binary from the [latest release](https://github.com/SikKhan/Cullr/releases/latest):
+
+```sh
+tar xzf cullr-*-x86_64-linux.tar.gz
+./cullr-ui /path/to/photos
+```
+
+Or build from source. Prerequisites: Rust 1.85+.
 
 ```sh
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
