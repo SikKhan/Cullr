@@ -538,7 +538,7 @@ impl GridView {
 
         let tally = self.tally();
         egui::Panel::top(egui::Id::new("cullr_grid_top_bar")).show(ui, |ui| {
-            self.top_bar(ui, &tally, &mut action);
+            self.top_bar(ui, db, &tally, &mut action);
         });
         if self.show_filter_bar() {
             egui::Panel::top(egui::Id::new("cullr_filter_bar")).show(ui, |ui| {
@@ -577,7 +577,13 @@ impl GridView {
     /// Persistent top bar: back affordance, folder name, status stats —
     /// shown/total when filtered, ingest progress + rate while extracting,
     /// and a clickable error counter that jumps between failed tiles.
-    fn top_bar(&mut self, ui: &mut egui::Ui, tally: &Tally, action: &mut Option<Action>) {
+    fn top_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        db: &cullr_core::Db,
+        tally: &Tally,
+        action: &mut Option<Action>,
+    ) {
         ui.add_space(2.0);
         ui.horizontal(|ui| {
             if ui.button("‹ Back").clicked() {
@@ -591,15 +597,22 @@ impl GridView {
             );
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // Live state of the cull-pass mode; the tooltip carries
-                // the shortcut since the bar has no room for hints.
+                // Live state of the cull-pass mode, clickable for mouse
+                // users; the tooltip carries the shortcut since the bar
+                // has no room for hints.
                 let (text, color) = if self.auto_advance {
                     ("auto-advance on", theme::ACCENT)
                 } else {
                     ("auto-advance off", theme::MUTED)
                 };
-                ui.label(egui::RichText::new(text).color(color))
-                    .on_hover_text("Tab — after labeling, jump to the next photo");
+                if ui
+                    .button(egui::RichText::new(text).color(color))
+                    .on_hover_text("Tab — after labeling, jump to the next photo")
+                    .clicked()
+                {
+                    self.auto_advance = !self.auto_advance;
+                    widgets::store_auto_advance(db, self.auto_advance);
+                }
                 if tally.errors > 0 && draw_error_chip(ui, tally.errors) {
                     self.jump_next_error();
                 }
