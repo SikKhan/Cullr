@@ -3,8 +3,8 @@
 [![Release](https://img.shields.io/github/v/release/SikKhan/Cullr)](https://github.com/SikKhan/Cullr/releases/latest)
 [![CI](https://github.com/SikKhan/Cullr/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/SikKhan/Cullr/actions/workflows/ci.yml)
 
-Photo Mechanic-style culling for RAW photographs. 
-Open a folder, browse embedded JPEG previews instantly, mark colors, filter. Keyboard-first.
+Photo Mechanic-style culling for RAW photographs.
+Open a folder, browse embedded JPEG previews instantly, mark colors and filter.
 
 ![Contact sheet: virtualized grid with filter chips, live counts, color labels, zoom slider and sort](docs/screenshots/grid.png)
 
