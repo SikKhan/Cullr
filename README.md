@@ -138,6 +138,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 ```
 
+Cutting a release: bump `version` in the workspace [Cargo.toml](Cargo.toml), commit, then tag and push `vX.Y.Z` — the release workflow gates on fmt/clippy/tests, builds the deb, rpm, Arch package and portable tarball via [packaging/build-packages.sh](packaging/build-packages.sh), and attaches them to the GitHub release.
+
 Performance gates:
 
 ```sh

@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# Builds the Linux packages attached to a Cullr GitHub release:
+# Builds every artifact attached to a Cullr GitHub release:
 #
 #   dist/cullr_<ver>-1_amd64.deb            Debian/Ubuntu  (apt install ./…)
 #   dist/cullr-<ver>-1.x86_64.rpm           Fedora/RHEL    (dnf install ./…)
 #   dist/cullr-<ver>-1-x86_64.pkg.tar.zst   Arch Linux     (pacman -U ./…)
+#   dist/cullr-<ver>-x86_64-linux.tar.gz    portable tarball
 #
 # Prerequisites: cargo, dpkg-deb, cargo-generate-rpm (`cargo install
-# cargo-generate-rpm`), zstd. Run from the repository root, or anywhere —
-# the script relocates itself. Pass --no-build to reuse the existing
-# target/release/cullr-ui.
+# cargo-generate-rpm`), zstd. Runs anywhere those exist — including the
+# GitHub release workflow, where the pacman package's absence of any
+# pacman dependency is exactly what makes it buildable. Pass --no-build
+# to reuse the existing target/release/cullr-ui.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -124,5 +126,13 @@ tar --zstd -cf "dist/cullr-${version}-1-x86_64.pkg.tar.zst" \
     --sort=name --mtime="@${epoch}" --owner=0 --group=0 --numeric-owner \
     -C "$pkg" .PKGINFO .MTREE usr
 
+# --- portable tarball --------------------------------------------------------
+# Standalone binary for distros without a matching package; same layout as
+# the packages minus installation.
+tar -cf - -C target/release --sort=name --mtime="@${epoch}" \
+    --owner=0 --group=0 --numeric-owner cullr-ui \
+    | gzip -n > "dist/cullr-${version}-x86_64-linux.tar.gz"
+
 echo "==> artifacts:"
-ls -lh dist/cullr_*.deb dist/cullr-*.rpm dist/cullr-*.pkg.tar.zst
+ls -lh dist/cullr_*.deb dist/cullr-*.rpm dist/cullr-*.pkg.tar.zst \
+    dist/cullr-*.tar.gz
