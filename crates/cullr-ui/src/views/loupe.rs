@@ -276,26 +276,38 @@ impl LoupeView {
             self.pan = pan;
         }
 
-        let scroll = ui.input(|input| input.smooth_scroll_delta.y);
+        // Wheel zooming has two channels in egui: plain scroll lands in
+        // smooth_scroll_delta (SPEC §6), while Ctrl/Cmd + scroll and
+        // trackpad pinch are routed into zoom_delta instead — one event
+        // never feeds both, so nothing applies twice.
+        let (scroll, zoom_gesture) =
+            ui.input(|input| (input.smooth_scroll_delta.y, input.zoom_delta()));
         if !suspended
-            && scroll != 0.0
             && response.hovered()
             && let Some(cursor) = response.hover_pos()
         {
-            let factor = (scroll * WHEEL_GAIN)
-                .exp()
-                .clamp(1.0 / WHEEL_STEP_MAX, WHEEL_STEP_MAX);
-            let (zoom, pan) = zoom_step(
-                self.zoom,
-                self.pan,
-                factor,
-                max_zoom,
-                cursor - area.center(),
-                fitted_size,
-                image_area.size(),
-            );
-            self.zoom = zoom;
-            self.pan = pan;
+            let factor = if zoom_gesture != 1.0 {
+                zoom_gesture.clamp(1.0 / WHEEL_STEP_MAX, WHEEL_STEP_MAX)
+            } else if scroll != 0.0 {
+                (scroll * WHEEL_GAIN)
+                    .exp()
+                    .clamp(1.0 / WHEEL_STEP_MAX, WHEEL_STEP_MAX)
+            } else {
+                1.0
+            };
+            if factor != 1.0 {
+                let (zoom, pan) = zoom_step(
+                    self.zoom,
+                    self.pan,
+                    factor,
+                    max_zoom,
+                    cursor - area.center(),
+                    fitted_size,
+                    image_area.size(),
+                );
+                self.zoom = zoom;
+                self.pan = pan;
+            }
         }
 
         // Shift starts a marquee-zoom drag instead of a pan; the region

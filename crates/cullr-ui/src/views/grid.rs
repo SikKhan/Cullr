@@ -67,6 +67,10 @@ pub const CELL_MAX_WIDTH: f32 = 1024.0;
 /// Points of cell growth per point of Ctrl+wheel scroll; a typical notch
 /// (~50 pts) then steps ~25 px, sweeping the range in a few turns.
 const ZOOM_WHEEL_GAIN: f32 = 0.5;
+/// egui 0.36's `InputOptions::scroll_zoom_speed` (not overridden here):
+/// the exponent scale that turns Ctrl/Cmd + wheel points into the
+/// multiplicative [`egui::InputState::zoom_delta`] gesture.
+const EGUI_ZOOM_GESTURE_SPEED: f32 = 1.0 / 200.0;
 /// Inner padding between cell border and image area.
 const CELL_PADDING: f32 = 8.0;
 /// Filename strip height inside a tile: the name line plus the RAW+JPEG
@@ -1293,23 +1297,19 @@ impl GridView {
         let geom = CellGeom::new(self.cell_width);
         ui.spacing_mut().item_spacing = egui::vec2(GAP, GAP);
         let total_rows = self.view.len().div_ceil(columns);
-        // Zoom takes the wheel before the scroll area sees it: with Ctrl
-        // held and the pointer over the sheet, the delta drives the cell
-        // size and is zeroed out so the sheet does not also scroll.
+        // Zoom takes the wheel before the scroll area sees it. Since
+        // egui 0.36 a Ctrl/Cmd + scroll gesture arrives through
+        // `zoom_delta` (multiplicative) while `smooth_scroll_delta`
+        // stays zero, so the old modifier + scroll-delta check could
+        // never fire; the factor is converted back to linear points to
+        // keep the cell-size gain's original meaning.
         if !suspended {
-            let (wheel_zooming, scroll_y, pointer) = ui.input(|input| {
-                (
-                    input.modifiers.command,
-                    input.smooth_scroll_delta.y,
-                    input.pointer.hover_pos(),
-                )
-            });
-            if wheel_zooming
-                && scroll_y != 0.0
-                && pointer.is_some_and(|pointer| ui.max_rect().contains(pointer))
+            let (zoom_gesture, pointer) =
+                ui.input(|input| (input.zoom_delta(), input.pointer.hover_pos()));
+            if zoom_gesture != 1.0 && pointer.is_some_and(|pointer| ui.max_rect().contains(pointer))
             {
+                let scroll_y = zoom_gesture_to_scroll(zoom_gesture);
                 self.cell_width = zoomed_cell_width(self.cell_width, scroll_y);
-                ui.input_mut(|input| input.smooth_scroll_delta = egui::Vec2::ZERO);
             }
         }
         let view = &self.view;
@@ -1761,6 +1761,17 @@ pub(crate) fn zoomed_cell_width(current: f32, scroll_y: f32) -> f32 {
     (current + scroll_y * ZOOM_WHEEL_GAIN).clamp(CELL_MIN_WIDTH, CELL_MAX_WIDTH)
 }
 
+/// Linear scroll points equivalent to an egui zoom gesture of `factor`.
+///
+/// egui 0.36 folds Ctrl/Cmd + wheel into a multiplicative
+/// [`egui::InputState::zoom_delta`] via
+/// `exp(points · EGUI_ZOOM_GESTURE_SPEED)`; inverting that mapping keeps
+/// the points fed to [`zoomed_cell_width`] on the same scale the gain
+/// was tuned for. Pinch gestures ride the same channel.
+fn zoom_gesture_to_scroll(factor: f32) -> f32 {
+    factor.max(f32::EPSILON).ln() / EGUI_ZOOM_GESTURE_SPEED
+}
+
 /// Cursor position after an arrow press: left/right step by one, up/down
 /// by a full row. Every move clamps inside the set instead of wrapping,
 /// so the cursor is never flung to the far side of the sheet; `None`
@@ -1963,6 +1974,23 @@ mod tests {
         );
         assert_eq!(zoomed_cell_width(CELL_MIN_WIDTH, -10_000.0), CELL_MIN_WIDTH);
         assert_eq!(zoomed_cell_width(CELL_MAX_WIDTH, 10_000.0), CELL_MAX_WIDTH);
+    }
+
+    #[test]
+    fn zoom_gesture_to_scroll_should_invert_eguis_exponential_mapping() {
+        // egui turns points into a factor via exp(points / speed); the
+        // inverse must recover those points, including shrink gestures
+        // and degenerate factors.
+        for points in [-120.0_f32, -7.5, 0.0, 3.25, 200.0] {
+            let factor = (points * EGUI_ZOOM_GESTURE_SPEED).exp();
+            assert!(
+                (zoom_gesture_to_scroll(factor) - points).abs() < 1e-3,
+                "factor {factor} should map back to {points}"
+            );
+        }
+        // Degenerate factors clamp through f32::EPSILON into a large
+        // shrink; zoomed_cell_width clamps the result at the cell floor.
+        assert!(zoom_gesture_to_scroll(0.0) < -3_000.0);
     }
 
     #[test]
