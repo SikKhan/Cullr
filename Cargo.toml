@@ -8,6 +8,7 @@ edition = "2024"
 rust-version = "1.85"
 license = "GPL-3.0-or-later"
 authors = ["Cullr contributors"]
+repository = "https://github.com/SikKhan/Cullr"
 
 [workspace.dependencies]
 eframe = "0.36"
