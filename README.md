@@ -37,7 +37,15 @@ Open a folder, browse embedded JPEG previews instantly, mark colors, filter. Key
 
 ## Install & build
 
-**Download:** grab the pre-built Linux binary from the [latest release](https://github.com/SikKhan/Cullr/releases/latest):
+**Download:** grab a package for your distro from the [latest release](https://github.com/SikKhan/Cullr/releases/latest):
+
+| Distro | Install |
+|---|---|
+| Debian / Ubuntu | `sudo apt install ./cullr_*_amd64.deb` |
+| Fedora / RHEL | `sudo dnf install ./cullr-*.x86_64.rpm` |
+| Arch Linux | `sudo pacman -U cullr-*.pkg.tar.zst` |
+
+Or run the portable tarball without installing:
 
 ```sh
 tar xzf cullr-*-x86_64-linux.tar.gz

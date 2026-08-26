@@ -1,4 +1,5 @@
 /target
+/crates/*/target
 *.swp
 .DS_Store
 Cargo.lock.orig

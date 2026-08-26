@@ -26,3 +26,32 @@ tempfile.workspace = true
 
 [lints]
 workspace = true
+
+# RPM packaging metadata, built by `cargo generate-rpm` (see
+# packaging/build-packages.sh). The binary itself only hard-links
+# glibc/libgcc — winit dlopens X11/Wayland and rfd dlopens GTK at runtime —
+# but the display stack is listed as Requires because the app cannot show
+# a window without it. glibc floor comes from the GLIBC_2.39 symbols the
+# toolchain emits (Pop!_OS 24.04); auto-req is off so exactly this list
+# ships.
+[package.metadata.generate-rpm]
+name = "cullr"
+summary = "Photo Mechanic-style culling tool for RAW photographs"
+release = "1"
+url = "https://github.com/SikKhan/Cullr"
+auto-req = "no"
+require-sh = false
+requires = { glibc = ">= 2.39", libgcc = "", gtk3 = "", libX11 = "", libXcursor = "", libXrandr = "", libXi = "", libxkbcommon = "", libxkbcommon-x11 = "", wayland = "", mesa-libGL = "" }
+
+[[package.metadata.generate-rpm.assets]]
+# Paths are relative to the crate dir (the script runs `cargo generate-rpm`
+# from here).
+source = "../../target/release/cullr-ui"
+dest = "/usr/bin/cullr-ui"
+mode = "755"
+
+[[package.metadata.generate-rpm.assets]]
+source = "../../LICENSE"
+dest = "/usr/share/licenses/cullr/LICENSE"
+mode = "644"
+doc = true
