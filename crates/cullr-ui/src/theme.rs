@@ -6,6 +6,11 @@ use cullr_core::Label;
 
 /// App background.
 pub const BG: Color32 = Color32::from_rgb(0x16, 0x17, 0x1A);
+/// Lightbox backdrop: photo floats alone on near-pure black.
+pub const VOID: Color32 = Color32::from_rgb(0x05, 0x05, 0x05);
+/// Lightbox white backdrop: pure white for judging high-key frames and
+/// highlight placement against a bright surround.
+pub const PAPER: Color32 = Color32::WHITE;
 /// Panel / bar fill.
 pub const PANEL: Color32 = Color32::from_rgb(0x1E, 0x20, 0x23);
 /// Primary text color.

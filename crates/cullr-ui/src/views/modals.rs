@@ -22,7 +22,7 @@ const PANEL_RADIUS: f32 = 10.0;
 const BACKDROP_DIM: egui::Color32 = egui::Color32::from_black_alpha(150);
 
 /// Keyboard shortcuts shown in the overlay, mirroring SPEC §6 exactly.
-const KEYBOARD_ROWS: [(&str, &str); 11] = [
+const KEYBOARD_ROWS: [(&str, &str); 15] = [
     ("← → ↑ ↓", "move the cursor"),
     ("1 … 5", "label red / yellow / green / blue / purple"),
     ("0", "clear the label"),
@@ -30,6 +30,10 @@ const KEYBOARD_ROWS: [(&str, &str); 11] = [
     ("Tab", "toggle auto-advance after labeling"),
     ("Enter · Esc", "loupe ⇄ contact sheet"),
     ("Space", "loupe: fit ↔ 100% · sheet: open the loupe"),
+    ("Ctrl+0 · Ctrl+1", "loupe: fit ↔ 100% pixel parity"),
+    ("Ctrl+= · Ctrl+-", "loupe: zoom in / out a step"),
+    ("L", "lightbox · sheet: open straight into it"),
+    ("W", "lightbox: white ↔ black backdrop"),
     ("Ctrl+A · Shift+A", "select all / none"),
     ("Ctrl+E", "export originals (selection · filtered view)"),
     ("F", "cycle filter preset: All → Labeled → Unlabeled"),
@@ -37,7 +41,7 @@ const KEYBOARD_ROWS: [(&str, &str); 11] = [
 ];
 
 /// Mouse behaviors shown alongside [`KEYBOARD_ROWS`].
-const MOUSE_ROWS: [(&str, &str); 8] = [
+const MOUSE_ROWS: [(&str, &str); 10] = [
     ("Click", "focus + select a tile"),
     ("Ctrl-click", "toggle a tile in the selection"),
     ("Shift-click", "select the range from the anchor"),
@@ -46,6 +50,8 @@ const MOUSE_ROWS: [(&str, &str); 8] = [
     ("Wheel", "scroll the sheet"),
     ("Ctrl+Wheel", "cell size"),
     ("Loupe wheel / drag", "zoom toward cursor / pan"),
+    ("Loupe double-click", "flip fit ↔ 100% under the cursor"),
+    ("Loupe Shift-drag", "marquee zoom into a region"),
 ];
 
 /// Open-state of the app's modal dialogs; owned by the app shell.
@@ -381,10 +387,10 @@ mod tests {
 
     #[test]
     fn shortcut_tables_should_stay_in_sync_with_the_spec_shape() {
-        // SPEC §6 lists eleven keyboard rows; the mouse table mirrors the
+        // SPEC §6 lists the keyboard rows; the mouse table mirrors the
         // selection + zoom behaviors documented there.
-        assert_eq!(KEYBOARD_ROWS.len(), 11);
-        assert_eq!(MOUSE_ROWS.len(), 8);
+        assert_eq!(KEYBOARD_ROWS.len(), 15);
+        assert_eq!(MOUSE_ROWS.len(), 10);
         assert!(
             KEYBOARD_ROWS
                 .iter()

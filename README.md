@@ -18,6 +18,8 @@ Culling speed comes from embedded JPEG previews, never full RAW decode. The cont
 
 - Virtualized contact sheet: only visible cells own GPU textures (LRU cache, 512 MB budget)
 - Full-screen loupe: fit / 100% zoom toward cursor, drag to pan, neighbor prefetch
+- Photoshop-style zoom: `Ctrl+0` fit / `Ctrl+1` 100%, `Ctrl+=` / `Ctrl+-` steps, double-click flips under the cursor, Shift-drag marquee zoom, zoom % pill with scrubby drag
+- Lightbox (`L`): chromeless photo on black (or pure white with `W`) for an unobstructed look — from the grid or the loupe
 - Portrait auto-detect: EXIF orientation applied on display; `[` / `]` rotate manually (persisted)
 - Color labels `1`–`5` / `0` (red, yellow, green, blue, purple / clear), persisted instantly
 - Auto-advance after labeling (`Tab` toggle, persisted)
@@ -66,12 +68,16 @@ Linux-first (X11 and Wayland verified), portable anywhere Rust builds. No system
 | `Tab` | toggle auto-advance-after-label (persisted) |
 | `Enter` / `Esc` | loupe ⇄ grid |
 | `Space` | loupe: fit/100% · grid: enter loupe |
+| `Ctrl+0` / `Ctrl+1` | loupe: fit / 100% pixel parity |
+| `Ctrl+=` / `Ctrl+-` | loupe: zoom in / out a step |
+| `L` | lightbox on/off · grid: open straight into it |
+| `W` | lightbox: white ↔ black backdrop |
 | `Ctrl+A` / `Shift+A` | select all / none |
 | `Ctrl+E` | export originals (selection, else filtered view) |
 | `F` | cycle filter preset: All → Labeled → Unlabeled |
 | `?` | shortcut overlay |
 
-Mouse: click selects, Ctrl-click toggles, Shift-click extends a range, drag draws a marquee; Ctrl+wheel zooms cell size (grid) or zooms toward the cursor (loupe).
+Mouse: click selects, Ctrl-click toggles, Shift-click extends a range, drag draws a marquee; Ctrl+wheel zooms cell size (grid) or zooms toward the cursor (loupe). In the loupe, double-click flips fit ↔ 100% under the cursor and Shift-drag marquee-zooms into a region.
 
 ## Performance
 

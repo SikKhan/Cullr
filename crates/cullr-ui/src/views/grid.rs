@@ -187,11 +187,11 @@ pub struct GridView {
     /// Zoomable cell long edge in points (SPEC §6); geometry per frame
     /// derives from it via [`CellGeom::new`].
     cell_width: f32,
-    /// Loupe position queued by a keyboard open. Creation waits for the
-    /// next frame because the opening keypress must not leak into the
-    /// loupe's own handlers (Space would start it zoomed, Enter would
-    /// close it instantly).
-    open_requested: Option<usize>,
+    /// Loupe open queued by a keyboard open or double-click. Creation
+    /// waits for the next frame because the opening keypress must not
+    /// leak into the loupe's own handlers (Space would start it zoomed,
+    /// Enter would close it instantly).
+    open_requested: Option<OpenRequest>,
     /// Full-screen preview state while the loupe is open; `None` shows
     /// the contact sheet (SPEC §6: Grid ⇄ Loupe).
     loupe: Option<loupe::LoupeView>,
@@ -220,6 +220,15 @@ pub struct GridView {
 struct ExportNote {
     text: String,
     color: egui::Color32,
+}
+
+/// A queued loupe open: position in the filtered order plus whether it
+/// mounts straight into the chromeless lightbox (`L`) or the normal
+/// loupe (`Enter`, `Space`, double-click).
+#[derive(Clone, Copy, Debug)]
+struct OpenRequest {
+    index: usize,
+    lightbox: bool,
 }
 
 impl GridView {
@@ -440,7 +449,13 @@ impl GridView {
         // Mount a loupe queued last frame before any input handling, so
         // its first drawn frame starts with fresh key state.
         if self.loupe.is_none() && !suspended {
-            self.loupe = self.open_requested.take().map(loupe::LoupeView::at);
+            self.loupe = self.open_requested.take().map(|request| {
+                if request.lightbox {
+                    loupe::LoupeView::at_in_lightbox(request.index)
+                } else {
+                    loupe::LoupeView::at(request.index)
+                }
+            });
         }
         // Keyboard-first navigation. While the loupe is up it owns every
         // key except `F`; on the sheet, Esc leaves the folder and the
@@ -453,16 +468,17 @@ impl GridView {
             && !suspended
             && ui.ctx().input(|input| input.key_pressed(egui::Key::Escape));
         let sheet_keys = self.loupe.is_none() && !self.view.is_empty() && !suspended;
-        let (enter, space, nav) = if sheet_keys {
+        let (enter, space, lightbox_open, nav) = if sheet_keys {
             ui.ctx().input(|input| {
                 (
                     input.key_pressed(egui::Key::Enter),
                     input.key_pressed(egui::Key::Space),
+                    input.key_pressed(egui::Key::L),
                     NAV_KEYS.into_iter().find(|key| input.key_pressed(*key)),
                 )
             })
         } else {
-            (false, false, None)
+            (false, false, false, None)
         };
         // Select all / none sweep only what survives the filter: photos
         // hidden by a chip never join a batch (SPEC §6 keyboard map).
@@ -530,9 +546,13 @@ impl GridView {
                 self.scroll_target = Some(next);
             }
             // Full keyboard cull pass: Enter/Space jump into the loupe at
-            // the cursor so digits keep flowing without touching the mouse.
-            if enter || space {
-                self.open_requested = Some(self.cursor.unwrap_or(0));
+            // the cursor so digits keep flowing without touching the mouse;
+            // L goes one step further and opens straight into the lightbox.
+            if enter || space || lightbox_open {
+                self.open_requested = Some(OpenRequest {
+                    index: self.cursor.unwrap_or(0),
+                    lightbox: lightbox_open,
+                });
             }
         }
 
@@ -1414,7 +1434,10 @@ impl GridView {
                 self.cursor = Some(position);
                 self.anchor = Some(position);
                 self.selection = self.id_at(position).into_iter().collect();
-                self.open_requested = Some(position);
+                self.open_requested = Some(OpenRequest {
+                    index: position,
+                    lightbox: false,
+                });
             } else if let Some(position) = clicked {
                 let modifiers = ui.ctx().input(|input| input.modifiers);
                 self.cursor = Some(position);

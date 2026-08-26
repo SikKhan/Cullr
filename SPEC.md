@@ -114,7 +114,9 @@ Views: Home → Grid ⇄ Loupe. Top bar persists in Grid/Loupe.
 
 **Grid:** virtualized — render only visible rows (+1 margin) from ScrollArea offset. Cell = image + border (accent = cursor) + bottom strip (label dot, truncated filename). Zoom slider + Ctrl+wheel, 128–1024 px cells. Sort: filename / taken_at.
 
-**Loupe:** fit-to-window; wheel zooms toward cursor (fit ↔ 100%); drag pans; Space toggles; arrows navigate within filtered order; Esc → Grid. Bottom EXIF bar: `camera · lens · f/xx · 1/xxx s · ISO x · xxmm · timestamp`. Overlay top-right: label + `142 / 3 210`.
+**Loupe:** fit-to-window; wheel zooms toward cursor (fit ↔ 100%); drag pans; Space toggles; arrows navigate within filtered order; Esc → Grid. Photoshop-style zoom aids: `Ctrl+0` fit, `Ctrl+1` 100%, `Ctrl+=`/`Ctrl+-` multiplicative steps, double-click flips the extremes under the cursor, Shift-drag marquee zooms a region to the viewport. Bottom-left pill: zoom % of native resolution with −/+ click steps and scrubby drag. Bottom EXIF bar: `camera · lens · f/xx · 1/xxx s · ISO x · xxmm · timestamp`. Overlay top-right: label + `142 / 3 210`.
+
+**Lightbox:** `L` (grid or loupe) strips all chrome — photo alone on near-black, `W` flips the backdrop to pure white for high-key frames. Zooming, panning, navigation, labels and rotation keep working; `Esc`/`Enter`/`L` restores the loupe chrome before a second press returns to Grid.
 
 **Filter bar:** multi-toggle chips `[All] [○ unlabeled] [R][Y][G][B][P]`, per-chip counts, live refilter. Status bar: shown/total, ingest progress + rate, clickable error count.
 
@@ -128,6 +130,10 @@ Views: Home → Grid ⇄ Loupe. Top bar persists in Grid/Loupe.
 | `Tab` | toggle auto-advance-after-label (persisted) |
 | `Enter` / `Esc` | loupe ⇄ grid |
 | `Space` | loupe: fit/100% · grid: enter loupe |
+| `Ctrl+0` / `Ctrl+1` | loupe: fit ↔ 100% pixel parity |
+| `Ctrl+=` / `Ctrl+-` | loupe: zoom in / out a step |
+| `L` | lightbox on/off · grid: open straight into it |
+| `W` | lightbox: white ↔ black backdrop |
 | `Ctrl+A` / `Shift+A` | select all / none |
 | `Ctrl+E` | export originals: selection, else the filtered view (bottom-right button); RAW+JPEG pairs copy both files |
 | `F` | cycle filter preset: All → Labeled → Unlabeled |

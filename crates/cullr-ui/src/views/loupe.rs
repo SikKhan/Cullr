@@ -3,13 +3,26 @@
 //! The photo renders aspect-fit inside the viewport; the wheel zooms
 //! toward the cursor between fit (×1) and pixel parity (100%), dragging
 //! pans while clamped so the image can never be flung off-screen, and
-//! `Space` toggles the two extremes. Arrows walk the folder order,
-//! `Esc`/`Enter` return to the sheet. While the screen-size texture
-//! decodes, a shimmer placeholder keeps the frame alive; neighbours ±3
-//! positions prefetch their previews in the background (SPEC §5.3).
+//! `Space` toggles the two extremes. Photoshop-style zoom aids layer on
+//! top: `Ctrl+0` / `Ctrl+1` jump to fit / 100%, `Ctrl+=` / `Ctrl+-`
+//! step multiplicatively, double-click toggles the extremes under the
+//! cursor, and Shift+drag draws a marquee that zooms so the selected
+//! region fills the viewport. A bottom-left pill shows the current
+//! percentage of native resolution, with click steps and scrubby drag.
+//! Arrows walk the folder order, `Esc`/`Enter` return to the sheet.
+//! While the screen-size texture decodes, a shimmer placeholder keeps
+//! the frame alive; neighbours ±3 positions prefetch their previews in
+//! the background (SPEC §5.3).
+//!
+//! The lightbox (`L`, also straight from the sheet) hides every piece
+//! of chrome — EXIF bar, pills, palette — and floats the photo alone on
+//! black for an unobstructed look; `W` flips that backdrop to pure
+//! white for judging high-key frames. Zooming, panning, navigation and
+//! labeling keep working inside it; the same keys restore the chrome
+//! before a second press leaves the loupe entirely.
 //!
 //! Overlays: a top-right pill with the color label and position counter
-//! (`142 / 3 210`) and a bottom EXIF summary bar.
+//! (`142 / 3 210`), a bottom EXIF summary bar and the zoom indicator.
 
 use eframe::egui;
 
@@ -30,8 +43,18 @@ const FIT_ZOOM: f32 = 1.0;
 const WHEEL_GAIN: f32 = 0.0016;
 /// Per-frame wheel step clamp so a runaway trackpad cannot teleport zoom.
 const WHEEL_STEP_MAX: f32 = 1.35;
+/// Multiplicative factor per `Ctrl+=` / `Ctrl+-` press and per zoom-pill
+/// button click — the classic discrete zoom cadence.
+const ZOOM_KEY_STEP: f32 = 1.25;
+/// Horizontal pill drag distance that multiplies zoom by e (scrubby).
+const SCRUB_GAIN: f32 = 0.01;
+/// Smallest marquee side accepted as a deliberate region selection;
+/// shorter drags are noise around a click and change nothing.
+const MARQUEE_MIN: f32 = 8.0;
 /// Height of the bottom EXIF bar.
 const BAR_HEIGHT: f32 = 30.0;
+/// Height of the zoom indicator pill.
+const PILL_HEIGHT: f32 = 24.0;
 /// How many positions on each side of the current photo prefetch their
 /// screen texture (SPEC §5.3: loupe id±3).
 const NEIGHBOR_REACH: usize = 3;
@@ -53,6 +76,16 @@ pub struct LoupeView {
     zoom: f32,
     /// Displayed-image-center offset from the viewport center.
     pan: egui::Vec2,
+    /// Chromeless mode: photo alone on black, no bars or pills.
+    lightbox: bool,
+    /// Lightbox backdrop choice; white suits high-key frames that
+    /// vanish against the default near-black surround.
+    white_bg: bool,
+    /// Screen point where the Shift-drag marquee zoom started, while it
+    /// is being drawn. `Some` also suppresses panning for that drag.
+    marquee_anchor: Option<egui::Pos2>,
+    /// Live marquee rectangle for painting; resolved into a zoom on release.
+    marquee_rect: Option<egui::Rect>,
 }
 
 impl LoupeView {
@@ -62,7 +95,18 @@ impl LoupeView {
             index,
             zoom: FIT_ZOOM,
             pan: egui::Vec2::ZERO,
+            lightbox: false,
+            white_bg: false,
+            marquee_anchor: None,
+            marquee_rect: None,
         }
+    }
+
+    /// Opens the loupe straight into the lightbox (`L` from the sheet).
+    pub fn at_in_lightbox(index: usize) -> Self {
+        let mut loupe = Self::at(index);
+        loupe.lightbox = true;
+        loupe
     }
 
     /// Draws the screen, consumes input, and reports the next action.
@@ -94,8 +138,8 @@ impl LoupeView {
         if order.is_empty() || self.index >= order.len() {
             return Outcome::Close;
         }
-        let (left, right, escape, enter) = if suspended {
-            (false, false, false, false)
+        let (left, right, escape, enter, lightbox_key) = if suspended {
+            (false, false, false, false, false)
         } else {
             ui.ctx().input(|input| {
                 (
@@ -103,11 +147,23 @@ impl LoupeView {
                     input.key_pressed(egui::Key::ArrowRight),
                     input.key_pressed(egui::Key::Escape),
                     input.key_pressed(egui::Key::Enter),
+                    input.key_pressed(egui::Key::L),
                 )
             })
         };
-        if escape || enter {
+        // The lightbox unwraps first: the same keys that leave the loupe
+        // restore its chrome while the photo is shown without any.
+        if self.lightbox && (escape || enter || lightbox_key) {
+            self.lightbox = false;
+        } else if escape || enter {
             return Outcome::Close;
+        } else if lightbox_key {
+            self.lightbox = true;
+        }
+        // Backdrop color only means something in the lightbox; the
+        // choice sticks for the rest of the session.
+        if self.lightbox && !suspended && ui.ctx().input(|input| input.key_pressed(egui::Key::W)) {
+            self.white_bg = !self.white_bg;
         }
         // Navigation resets to fit: each photo starts centered.
         if left && self.index > 0 {
@@ -134,6 +190,9 @@ impl LoupeView {
         let row = order[self.index];
         let entry = &entries[row];
         let current_label = entry.label;
+        // Copied out before any mutable borrow of `entries` (labeling)
+        // so the zoom readout can use it afterwards.
+        let native_width = entry.display_pixels().map(|(width, _)| width);
         let detail = fetch_detail(db, entry.id);
 
         // Focus cancels stale neighbour decodes when flying through the
@@ -157,7 +216,10 @@ impl LoupeView {
 
         let (area, response) =
             ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
-        let image_area = egui::Rect::from_min_max(area.min, area.max - egui::vec2(0.0, BAR_HEIGHT));
+        // The lightbox gives the photo the whole screen; otherwise the
+        // bottom strip stays reserved for the EXIF bar.
+        let bar_height = if self.lightbox { 0.0 } else { BAR_HEIGHT };
+        let image_area = egui::Rect::from_min_max(area.min, area.max - egui::vec2(0.0, bar_height));
         let aspect = image_aspect(entry);
         let fitted_size = super::grid::fit_rect(image_area, aspect).size();
         let max_zoom = max_zoom(entry, fitted_size);
@@ -166,6 +228,52 @@ impl LoupeView {
             let zoomed_in = self.zoom > FIT_ZOOM + f32::EPSILON * 8.0;
             self.zoom = if zoomed_in { FIT_ZOOM } else { max_zoom };
             self.pan = egui::Vec2::ZERO;
+        }
+
+        // Photoshop-standard jumps and steps: fit, pixel parity, and
+        // multiplicative in/out anchored at the pointer when it hovers
+        // the photo, at the center otherwise.
+        let (fit_key, parity_key, step_in, step_out) = if suspended {
+            (false, false, false, false)
+        } else {
+            ui.ctx().input(|input| {
+                (
+                    input.key_pressed(egui::Key::Num0) && input.modifiers.command_only(),
+                    input.key_pressed(egui::Key::Num1) && input.modifiers.command_only(),
+                    (input.key_pressed(egui::Key::Equals) || input.key_pressed(egui::Key::Plus))
+                        && input.modifiers.command_only(),
+                    input.key_pressed(egui::Key::Minus) && input.modifiers.command_only(),
+                )
+            })
+        };
+        if fit_key {
+            self.zoom = FIT_ZOOM;
+            self.pan = egui::Vec2::ZERO;
+        }
+        if parity_key {
+            self.zoom = max_zoom;
+            self.pan = egui::Vec2::ZERO;
+        }
+        if step_in || step_out {
+            let anchor = response
+                .hover_pos()
+                .map_or(egui::Vec2::ZERO, |cursor| cursor - area.center());
+            let factor = if step_out {
+                1.0 / ZOOM_KEY_STEP
+            } else {
+                ZOOM_KEY_STEP
+            };
+            let (zoom, pan) = zoom_step(
+                self.zoom,
+                self.pan,
+                factor,
+                max_zoom,
+                anchor,
+                fitted_size,
+                image_area.size(),
+            );
+            self.zoom = zoom;
+            self.pan = pan;
         }
 
         let scroll = ui.input(|input| input.smooth_scroll_delta.y);
@@ -189,14 +297,84 @@ impl LoupeView {
             self.zoom = zoom;
             self.pan = pan;
         }
-        if !suspended && response.dragged() {
+
+        // Shift starts a marquee-zoom drag instead of a pan; the region
+        // drawn while it lasts is resolved into a zoom on release.
+        let shift_drag = !suspended
+            && response.drag_started()
+            && ui.ctx().input(|input| input.modifiers.shift_only());
+        if shift_drag
+            && let Some(origin) = response.interact_pointer_pos()
+            && image_area.contains(origin)
+        {
+            self.marquee_anchor = Some(origin);
+        }
+        if let Some(anchor) = self.marquee_anchor {
+            if response.dragged() {
+                if let Some(pointer) = response.interact_pointer_pos() {
+                    self.marquee_rect = Some(egui::Rect::from_two_pos(anchor, pointer));
+                }
+            }
+            if response.drag_stopped() {
+                if let Some(rect) = self.marquee_rect.take()
+                    && rect.width().min(rect.height()) >= MARQUEE_MIN
+                {
+                    let (zoom, pan) = marquee_zoom_step(
+                        rect,
+                        image_area.center(),
+                        self.zoom,
+                        self.pan,
+                        fitted_size,
+                        image_area.size(),
+                        max_zoom,
+                    );
+                    self.zoom = zoom;
+                    self.pan = pan;
+                }
+                self.marquee_anchor = None;
+            }
+        }
+        if !suspended && response.dragged() && self.marquee_anchor.is_none() {
             self.pan = clamp_pan(
                 self.pan + response.drag_delta(),
                 fitted_size * self.zoom,
                 image_area.size(),
             );
         }
+        // Double-click flips between the two extremes under the cursor,
+        // like clicking through Photoshop's zoom presets.
+        if !suspended
+            && response.double_clicked()
+            && let Some(cursor) = response.interact_pointer_pos()
+        {
+            let zoomed_in = self.zoom > FIT_ZOOM + f32::EPSILON * 8.0;
+            let factor = if zoomed_in {
+                FIT_ZOOM / self.zoom
+            } else {
+                max_zoom / self.zoom
+            };
+            let (zoom, pan) = zoom_step(
+                self.zoom,
+                self.pan,
+                factor,
+                max_zoom,
+                cursor - area.center(),
+                fitted_size,
+                image_area.size(),
+            );
+            self.zoom = zoom;
+            self.pan = pan;
+        }
 
+        let background = if self.lightbox {
+            if self.white_bg {
+                theme::PAPER
+            } else {
+                theme::VOID
+            }
+        } else {
+            theme::BG
+        };
         paint_photo(
             ui,
             textures,
@@ -206,24 +384,53 @@ impl LoupeView {
             aspect,
             self.zoom,
             self.pan,
+            background,
         );
-        draw_position_overlay(
-            ui.painter(),
-            image_area,
-            detail.as_ref(),
-            self.index + 1,
-            order.len(),
-        );
-        let swatch_pick = draw_exif_bar(
-            ui,
-            area,
-            detail.as_ref(),
-            entry,
-            current_label,
-            *auto_advance,
-        );
-        if let Some(label) = swatch_pick {
-            self.apply_label(entries, order, db, label, *auto_advance);
+        if let Some(rect) = self.marquee_rect {
+            draw_marquee(ui.painter(), image_area, rect);
+        }
+        // Chromeless lightbox: the photo alone, nothing else on screen.
+        if !self.lightbox {
+            draw_position_overlay(
+                ui.painter(),
+                image_area,
+                detail.as_ref(),
+                self.index + 1,
+                order.len(),
+            );
+            let swatch_pick = draw_exif_bar(
+                ui,
+                area,
+                detail.as_ref(),
+                entry,
+                current_label,
+                *auto_advance,
+            );
+            if let Some(label) = swatch_pick {
+                self.apply_label(entries, order, db, label, *auto_advance);
+            }
+            if let Some(percent) = zoom_percent(native_width, self.zoom, fitted_size)
+                && let Some(factor) = match draw_zoom_pill(ui, image_area, percent) {
+                    ZoomPill::None => None,
+                    ZoomPill::StepIn => Some(ZOOM_KEY_STEP),
+                    ZoomPill::StepOut => Some(1.0 / ZOOM_KEY_STEP),
+                    ZoomPill::Scrub(factor) => Some(factor),
+                }
+            {
+                // Pill steps and scrubs anchor at the viewport center:
+                // the pointer is on the pill, not on a photo point.
+                let (zoom, pan) = zoom_step(
+                    self.zoom,
+                    self.pan,
+                    factor,
+                    max_zoom,
+                    egui::Vec2::ZERO,
+                    fitted_size,
+                    image_area.size(),
+                );
+                self.zoom = zoom;
+                self.pan = pan;
+            }
         }
 
         Outcome::Stay
@@ -352,6 +559,53 @@ fn max_zoom(entry: &PhotoEntry, fitted_size: egui::Vec2) -> f32 {
     (width as f32 / fitted_size.x).max(FIT_ZOOM)
 }
 
+/// Current zoom as a percentage of native resolution (100% = pixel
+/// parity), the number Photoshop shows in its status bar. Takes the
+/// photo's displayed pixel width; `None` when unknown or the viewport
+/// collapsed.
+fn zoom_percent(native_width: Option<u32>, zoom: f32, fitted_size: egui::Vec2) -> Option<f32> {
+    let width = native_width?;
+    if fitted_size.x <= 0.0 {
+        return None;
+    }
+    Some(zoom * fitted_size.x / width as f32 * 100.0)
+}
+
+/// Zoom that makes the dragged `marquee` region fill the viewport,
+/// centered on the region's middle — Photoshop's marquee-zoom tool.
+///
+/// The factor scales whichever marquee side is relatively larger (the
+/// contain fit); the region's image point then lands exactly on the
+/// viewport center before the usual edge clamping applies. Returns fit
+/// centered when the clamp pulls the zoom back down.
+fn marquee_zoom_step(
+    marquee: egui::Rect,
+    viewport_center: egui::Pos2,
+    zoom: f32,
+    pan: egui::Vec2,
+    fitted_size: egui::Vec2,
+    viewport: egui::Vec2,
+    max_zoom: f32,
+) -> (f32, egui::Vec2) {
+    if fitted_size.x <= 0.0 || fitted_size.y <= 0.0 || zoom <= 0.0 {
+        return (zoom, pan);
+    }
+    let factor =
+        (viewport.x / marquee.width().max(1.0)).min(viewport.y / marquee.height().max(1.0));
+    let new_zoom = (zoom * factor).clamp(FIT_ZOOM, max_zoom.max(FIT_ZOOM));
+    if new_zoom <= FIT_ZOOM + f32::EPSILON * 8.0 {
+        return (new_zoom, egui::Vec2::ZERO);
+    }
+    // Fraction of the displayed image (from its center) the region covers.
+    let region_from_center = marquee.center() - viewport_center;
+    let anchor = (region_from_center - pan) / (fitted_size * zoom);
+    let new_pan = -anchor * (fitted_size * new_zoom);
+    (
+        new_zoom,
+        clamp_pan(new_pan, fitted_size * new_zoom, viewport),
+    )
+}
+
 /// Keeps the displayed image pinned to the viewport: at fit there is no
 /// slack (always centered); zoomed in, edges may reach but never pass
 /// the viewport edge.
@@ -398,6 +652,8 @@ fn zoom_step(
 
 /// The photo itself: ready texture (zoomable), shimmer while decoding,
 /// spinner while extraction is pending, warning fallback otherwise.
+/// The caller picks the backdrop — app background for the loupe,
+/// lightbox black or white otherwise.
 #[expect(clippy::too_many_arguments)]
 fn paint_photo(
     ui: &mut egui::Ui,
@@ -408,9 +664,10 @@ fn paint_photo(
     aspect: f32,
     zoom: f32,
     pan: egui::Vec2,
+    background: egui::Color32,
 ) {
     let painter = ui.painter().clone();
-    painter.rect_filled(area, 0.0, theme::BG);
+    painter.rect_filled(area, 0.0, background);
     let center = area.center() + pan;
     match entry.status {
         PhotoStatus::Ok => {
@@ -492,6 +749,115 @@ fn draw_warning(painter: &egui::Painter, area: egui::Rect, message: &str) {
         egui::FontId::proportional(13.0),
         theme::MUTED,
     );
+}
+
+/// Accent wash over the Shift-drag region while the marquee zoom is
+/// being drawn; clipped so it cannot spill onto bars or outside.
+fn draw_marquee(painter: &egui::Painter, clip: egui::Rect, rect: egui::Rect) {
+    let painter = painter.with_clip_rect(clip);
+    painter.rect_filled(rect, 0.0, theme::ACCENT.gamma_multiply(0.16));
+    painter.rect_stroke(
+        rect,
+        0.0,
+        egui::Stroke::new(1.25, theme::ACCENT),
+        egui::StrokeKind::Outside,
+    );
+}
+
+/// What the zoom indicator pill wants applied this frame.
+#[derive(Debug, PartialEq)]
+enum ZoomPill {
+    /// Nothing happened.
+    None,
+    /// The `−` side stepped out one notch.
+    StepOut,
+    /// The `+` side stepped in one notch.
+    StepIn,
+    /// The percentage was dragged; apply this multiplicative factor.
+    Scrub(f32),
+}
+
+/// Bottom-left zoom indicator (`− 42% +`) styled like the position
+/// pill. The buttons step like `Ctrl+=` / `Ctrl+-`; dragging the number
+/// scrubs zoom horizontally, Photoshop's scrubby slider. Anchoring is
+/// the caller's business — this only reports intent.
+fn draw_zoom_pill(ui: &mut egui::Ui, image_area: egui::Rect, percent: f32) -> ZoomPill {
+    let text_font = egui::FontId::proportional(12.0);
+    let glyph_font = egui::FontId::proportional(14.0);
+    let painter = ui.painter();
+    let label = painter.layout_no_wrap(format!("{:.0}%", percent), text_font, theme::TEXT);
+    let minus = painter.layout_no_wrap("−".to_owned(), glyph_font.clone(), theme::MUTED);
+    let plus = painter.layout_no_wrap("+".to_owned(), glyph_font, theme::MUTED);
+    let gap = 8.0;
+    let padding_x = 10.0;
+    let width = padding_x * 2.0 + minus.size().x + gap + label.size().x + gap + plus.size().x;
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(
+            image_area.left() + 12.0,
+            image_area.bottom() - 12.0 - PILL_HEIGHT,
+        ),
+        egui::vec2(width, PILL_HEIGHT),
+    );
+    painter.rect_filled(
+        rect,
+        PILL_HEIGHT / 2.0,
+        egui::Color32::from_black_alpha(160),
+    );
+
+    let mut action = ZoomPill::None;
+    let mut strip = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+    strip.spacing_mut().item_spacing.x = gap;
+    strip.horizontal(|ui| {
+        // `layout_no_wrap` hands back shared galleys; zones paint a clone
+        // centered inside their full-height hit target.
+        let glyph_zone =
+            |ui: &mut egui::Ui, galley: std::sync::Arc<egui::Galley>, hint: &'static str| {
+                let size = egui::vec2(galley.size().x, PILL_HEIGHT);
+                let (zone, response) = ui.allocate_exact_size(size, egui::Sense::click());
+                ui.painter().galley(
+                    egui::pos2(
+                        zone.center().x - galley.size().x / 2.0,
+                        zone.center().y - galley.size().y / 2.0,
+                    ),
+                    galley,
+                    theme::MUTED,
+                );
+                let response = response.on_hover_text(hint);
+                response.clicked()
+            };
+        if glyph_zone(ui, minus, "Zoom out (Ctrl+-)") {
+            action = ZoomPill::StepOut;
+        }
+        let (zone, response) = ui.allocate_exact_size(
+            egui::vec2(label.size().x, PILL_HEIGHT),
+            egui::Sense::click_and_drag(),
+        );
+        ui.painter().galley(
+            egui::pos2(
+                zone.center().x - label.size().x / 2.0,
+                zone.center().y - label.size().y / 2.0,
+            ),
+            label,
+            theme::TEXT,
+        );
+        let response = response
+            .on_hover_cursor(egui::CursorIcon::ResizeHorizontal)
+            .on_hover_text("Drag sideways to change zoom");
+        if response.dragged() {
+            let delta = response.drag_delta().x;
+            if delta != 0.0 {
+                action = ZoomPill::Scrub(
+                    (delta * SCRUB_GAIN)
+                        .exp()
+                        .clamp(1.0 / WHEEL_STEP_MAX, WHEEL_STEP_MAX),
+                );
+            }
+        }
+        if glyph_zone(ui, plus, "Zoom in (Ctrl+=)") {
+            action = ZoomPill::StepIn;
+        }
+    });
+    action
 }
 
 /// Top-right pill: color-label dot plus position counter `n / total`
@@ -651,6 +1017,9 @@ fn file_name(entry: &PhotoEntry) -> String {
 
 #[cfg(test)]
 mod tests {
+    // Test setup asserts hard failures; a broken fixture aborts the test.
+    #![expect(clippy::expect_used)]
+
     use super::*;
 
     #[test]
@@ -810,6 +1179,87 @@ mod tests {
             jpeg_rel_path: None,
         };
         assert_eq!(max_zoom(&entry, egui::vec2(500.0, 500.0)), 1.0);
+    }
+
+    #[test]
+    fn zoom_percent_should_report_the_native_resolution_fraction() {
+        let fitted = egui::vec2(1500.0, 1000.0);
+        let fit_pct = zoom_percent(Some(6000), FIT_ZOOM, fitted).expect("percent");
+        assert!((fit_pct - 25.0).abs() < 1e-4);
+        let parity_pct = zoom_percent(Some(6000), 4.0, fitted).expect("percent");
+        assert!((parity_pct - 100.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn zoom_percent_should_never_divide_by_missing_pixels_or_a_zero_viewport() {
+        assert_eq!(zoom_percent(None, FIT_ZOOM, egui::vec2(500.0, 500.0)), None);
+        assert_eq!(zoom_percent(Some(6000), FIT_ZOOM, egui::Vec2::ZERO), None);
+    }
+
+    #[test]
+    fn marquee_zoom_step_should_land_the_region_on_the_viewport_center() {
+        let viewport = egui::vec2(800.0, 600.0);
+        let center = egui::pos2(400.0, 300.0);
+        let fitted = egui::vec2(600.0, 400.0);
+        // A 320×300 region left of and below the image center.
+        let marquee = egui::Rect::from_min_size(egui::pos2(160.0, 190.0), egui::vec2(320.0, 300.0));
+
+        let (zoom, pan) = marquee_zoom_step(
+            marquee,
+            center,
+            FIT_ZOOM,
+            egui::Vec2::ZERO,
+            fitted,
+            viewport,
+            8.0,
+        );
+
+        // Contain picks the smaller factor; here the height constrains.
+        assert!((zoom - 2.0).abs() < 1e-4);
+        // The dragged region's image point must sit at the viewport
+        // center afterwards; nothing here hits the edge clamps.
+        let anchor = (marquee.center() - center) / fitted;
+        let landed = center + pan + anchor * (fitted * zoom);
+        assert!(landed.distance(center) < 1e-3, "landed at {landed:?}");
+    }
+
+    #[test]
+    fn marquee_zoom_step_should_clamp_to_fit_for_oversized_regions() {
+        let viewport = egui::vec2(800.0, 600.0);
+        let fitted = egui::vec2(600.0, 400.0);
+        let marquee = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 700.0));
+
+        let (zoom, pan) = marquee_zoom_step(
+            marquee,
+            egui::pos2(400.0, 300.0),
+            FIT_ZOOM,
+            egui::vec2(60.0, 0.0),
+            fitted,
+            viewport,
+            8.0,
+        );
+
+        assert!((zoom - FIT_ZOOM).abs() < 1e-6);
+        assert_eq!(pan, egui::Vec2::ZERO);
+    }
+
+    #[test]
+    fn marquee_zoom_step_should_clamp_to_pixel_parity_for_tiny_regions() {
+        let viewport = egui::vec2(800.0, 600.0);
+        let fitted = egui::vec2(600.0, 400.0);
+        let marquee = egui::Rect::from_min_size(egui::pos2(300.0, 250.0), egui::vec2(10.0, 10.0));
+
+        let (zoom, _) = marquee_zoom_step(
+            marquee,
+            egui::pos2(400.0, 300.0),
+            FIT_ZOOM,
+            egui::Vec2::ZERO,
+            fitted,
+            viewport,
+            4.0,
+        );
+
+        assert!((zoom - 4.0).abs() < 1e-5);
     }
 
     fn detail(fields: impl FnOnce(&mut PhotoDetail)) -> PhotoDetail {
