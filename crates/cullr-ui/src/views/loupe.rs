@@ -1,9 +1,11 @@
 //! Loupe view: full-screen preview with fit/zoom/pan (SPEC §6).
 //!
 //! The photo renders aspect-fit inside the viewport; the wheel zooms
-//! toward the cursor between fit (×1) and pixel parity (100%), dragging
-//! pans while clamped so the image can never be flung off-screen, and
-//! `Space` toggles the two extremes. Photoshop-style zoom aids layer on
+//! toward the cursor between fit (×1) and 400% — pixel parity (100%)
+//! sits in that range and the toggles treat it as the other extreme,
+//! while deep zoom keeps going past parity to expose the preview's own
+//! upscale softness. Dragging pans while clamped so the image can never
+//! be flung off-screen. Photoshop-style zoom aids layer on
 //! top: `Ctrl+0` / `Ctrl+1` jump to fit / 100%, `Ctrl+=` / `Ctrl+-`
 //! step multiplicatively, double-click toggles the extremes under the
 //! cursor, and Shift+drag draws a marquee that zooms so the selected
@@ -46,6 +48,10 @@ const WHEEL_STEP_MAX: f32 = 1.35;
 /// Multiplicative factor per `Ctrl+=` / `Ctrl+-` press and per zoom-pill
 /// button click — the classic discrete zoom cadence.
 const ZOOM_KEY_STEP: f32 = 1.25;
+/// How far past pixel parity (100%) zooming may go, as a multiple of
+/// parity: deep zoom inspects upscale softness and compression
+/// artifacts on the embedded preview itself.
+const PARITY_ZOOM_CAP: f32 = 4.0;
 /// Horizontal pill drag distance that multiplies zoom by e (scrubby).
 const SCRUB_GAIN: f32 = 0.01;
 /// Smallest marquee side accepted as a deliberate region selection;
@@ -222,11 +228,14 @@ impl LoupeView {
         let image_area = egui::Rect::from_min_max(area.min, area.max - egui::vec2(0.0, bar_height));
         let aspect = image_aspect(entry);
         let fitted_size = super::grid::fit_rect(image_area, aspect).size();
-        let max_zoom = max_zoom(entry, fitted_size);
+        // 100% is pixel parity of the embedded preview; the ceiling
+        // lets deep-zoom inspection continue past it.
+        let parity_zoom = parity_zoom(entry, fitted_size);
+        let zoom_ceiling = ceiling_zoom(entry, fitted_size);
 
         if !suspended && ui.ctx().input(|input| input.key_pressed(egui::Key::Space)) {
             let zoomed_in = self.zoom > FIT_ZOOM + f32::EPSILON * 8.0;
-            self.zoom = if zoomed_in { FIT_ZOOM } else { max_zoom };
+            self.zoom = if zoomed_in { FIT_ZOOM } else { parity_zoom };
             self.pan = egui::Vec2::ZERO;
         }
 
@@ -251,7 +260,7 @@ impl LoupeView {
             self.pan = egui::Vec2::ZERO;
         }
         if parity_key {
-            self.zoom = max_zoom;
+            self.zoom = parity_zoom;
             self.pan = egui::Vec2::ZERO;
         }
         if step_in || step_out {
@@ -267,7 +276,7 @@ impl LoupeView {
                 self.zoom,
                 self.pan,
                 factor,
-                max_zoom,
+                zoom_ceiling,
                 anchor,
                 fitted_size,
                 image_area.size(),
@@ -300,7 +309,7 @@ impl LoupeView {
                     self.zoom,
                     self.pan,
                     factor,
-                    max_zoom,
+                    zoom_ceiling,
                     cursor - area.center(),
                     fitted_size,
                     image_area.size(),
@@ -338,7 +347,7 @@ impl LoupeView {
                         self.pan,
                         fitted_size,
                         image_area.size(),
-                        max_zoom,
+                        zoom_ceiling,
                     );
                     self.zoom = zoom;
                     self.pan = pan;
@@ -363,13 +372,13 @@ impl LoupeView {
             let factor = if zoomed_in {
                 FIT_ZOOM / self.zoom
             } else {
-                max_zoom / self.zoom
+                parity_zoom / self.zoom
             };
             let (zoom, pan) = zoom_step(
                 self.zoom,
                 self.pan,
                 factor,
-                max_zoom,
+                zoom_ceiling,
                 cursor - area.center(),
                 fitted_size,
                 image_area.size(),
@@ -435,7 +444,7 @@ impl LoupeView {
                     self.zoom,
                     self.pan,
                     factor,
-                    max_zoom,
+                    zoom_ceiling,
                     egui::Vec2::ZERO,
                     fitted_size,
                     image_area.size(),
@@ -560,8 +569,9 @@ fn image_aspect(entry: &PhotoEntry) -> f32 {
 /// Zoom multiplier that makes the displayed image pixel-parity (100%) in
 /// the viewport; at least [`FIT_ZOOM`] so small previews stay put. Uses
 /// display pixels — a rotated portrait's parity width is its stored
-/// height, matching what the texture actually shows.
-fn max_zoom(entry: &PhotoEntry, fitted_size: egui::Vec2) -> f32 {
+/// height, matching what the texture actually shows. This is where the
+/// `Space` / `Ctrl+1` / double-click toggles land, not the ceiling.
+fn parity_zoom(entry: &PhotoEntry, fitted_size: egui::Vec2) -> f32 {
     let Some((width, _)) = entry.display_pixels() else {
         return FIT_ZOOM;
     };
@@ -569,6 +579,19 @@ fn max_zoom(entry: &PhotoEntry, fitted_size: egui::Vec2) -> f32 {
         return FIT_ZOOM;
     }
     (width as f32 / fitted_size.x).max(FIT_ZOOM)
+}
+
+/// Absolute zoom ceiling: [`PARITY_ZOOM_CAP`] × parity so deep zoom can
+/// keep going past 100% onto the preview's own upscale behavior. Stays
+/// at fit when the pixel size is unknown — there is no basis to
+/// interpolate beyond it.
+fn ceiling_zoom(entry: &PhotoEntry, fitted_size: egui::Vec2) -> f32 {
+    match entry.display_pixels() {
+        Some((width, _)) if fitted_size.x > 0.0 => {
+            ((width as f32 / fitted_size.x) * PARITY_ZOOM_CAP).max(FIT_ZOOM)
+        }
+        _ => FIT_ZOOM,
+    }
 }
 
 /// Current zoom as a percentage of native resolution (100% = pixel
@@ -597,14 +620,14 @@ fn marquee_zoom_step(
     pan: egui::Vec2,
     fitted_size: egui::Vec2,
     viewport: egui::Vec2,
-    max_zoom: f32,
+    ceiling: f32,
 ) -> (f32, egui::Vec2) {
     if fitted_size.x <= 0.0 || fitted_size.y <= 0.0 || zoom <= 0.0 {
         return (zoom, pan);
     }
     let factor =
         (viewport.x / marquee.width().max(1.0)).min(viewport.y / marquee.height().max(1.0));
-    let new_zoom = (zoom * factor).clamp(FIT_ZOOM, max_zoom.max(FIT_ZOOM));
+    let new_zoom = (zoom * factor).clamp(FIT_ZOOM, ceiling.max(FIT_ZOOM));
     if new_zoom <= FIT_ZOOM + f32::EPSILON * 8.0 {
         return (new_zoom, egui::Vec2::ZERO);
     }
@@ -641,12 +664,12 @@ fn zoom_step(
     zoom: f32,
     pan: egui::Vec2,
     factor: f32,
-    max_zoom: f32,
+    ceiling: f32,
     cursor_from_center: egui::Vec2,
     fitted_size: egui::Vec2,
     viewport: egui::Vec2,
 ) -> (f32, egui::Vec2) {
-    let new_zoom = (zoom * factor).clamp(FIT_ZOOM, max_zoom.max(FIT_ZOOM));
+    let new_zoom = (zoom * factor).clamp(FIT_ZOOM, ceiling.max(FIT_ZOOM));
     if (new_zoom - zoom).abs() <= f32::EPSILON * 8.0 {
         return (zoom, pan);
     }
@@ -1139,58 +1162,87 @@ mod tests {
     }
 
     #[test]
-    fn max_zoom_should_be_pixel_parity_over_the_fit_rect() {
-        let entry = PhotoEntry {
-            id: cullr_core::PhotoId(1),
-            rel_path: "a.nef".into(),
-            label: cullr_core::Label::None,
-            status: PhotoStatus::Ok,
-            pixels: Some((3000, 2000)),
-            orientation: 1,
-            rot_cw: 0,
-            thumb_path: None,
-            err_msg: None,
-            jpeg_rel_path: None,
-        };
-        // Fit rect is 1500 px wide: 100% needs exactly 2×.
-        assert!((max_zoom(&entry, egui::vec2(1500.0, 1000.0)) - 2.0).abs() < 1e-5);
+    fn parity_zoom_should_be_pixel_parity_over_the_fit_rect() {
+        let entry = entry();
+        // Fit rect is 1500 px wide of a 6000 px image: 100% needs 4×.
+        assert!((parity_zoom(&entry, egui::vec2(1500.0, 1000.0)) - 4.0).abs() < 1e-5);
     }
 
     #[test]
-    fn max_zoom_should_use_the_rotated_width_for_portrait_previews() {
-        let entry = PhotoEntry {
-            id: cullr_core::PhotoId(1),
-            rel_path: "a.nef".into(),
-            label: cullr_core::Label::None,
-            status: PhotoStatus::Ok,
-            pixels: Some((6000, 4000)),
-            orientation: 6,
-            rot_cw: 0,
-            thumb_path: None,
-            err_msg: None,
-            jpeg_rel_path: None,
-        };
+    fn parity_zoom_should_use_the_rotated_width_for_portrait_previews() {
+        let mut rotated = entry();
+        rotated.orientation = 6;
         // Displayed portrait at fit width 1333 px: parity needs the
         // stored height (4000), not the stored width.
         let expected = 4000.0 / 1333.0;
-        assert!((max_zoom(&entry, egui::vec2(1333.0, 2000.0)) - expected).abs() < 1e-3);
+        assert!((parity_zoom(&rotated, egui::vec2(1333.0, 2000.0)) - expected).abs() < 1e-3);
     }
 
     #[test]
-    fn max_zoom_should_stay_at_one_for_unknown_pixels() {
-        let entry = PhotoEntry {
-            id: cullr_core::PhotoId(1),
-            rel_path: "a.nef".into(),
-            label: cullr_core::Label::None,
-            status: PhotoStatus::Pending,
-            pixels: None,
-            orientation: 1,
-            rot_cw: 0,
-            thumb_path: None,
-            err_msg: None,
-            jpeg_rel_path: None,
-        };
-        assert_eq!(max_zoom(&entry, egui::vec2(500.0, 500.0)), 1.0);
+    fn parity_zoom_should_stay_at_one_for_unknown_pixels() {
+        let mut unknown = entry();
+        unknown.pixels = None;
+        assert_eq!(parity_zoom(&unknown, egui::vec2(500.0, 500.0)), 1.0);
+    }
+
+    #[test]
+    fn ceiling_zoom_should_allow_four_times_pixel_parity() {
+        // 6000 px native at fit width 1500: parity 4×, ceiling 400%.
+        let entry = entry();
+        let fitted = egui::vec2(1500.0, 1000.0);
+        assert!((ceiling_zoom(&entry, fitted) - 16.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn ceiling_zoom_should_stay_at_fit_without_a_pixel_size() {
+        let mut unknown = entry();
+        unknown.pixels = None;
+        assert_eq!(ceiling_zoom(&unknown, egui::vec2(500.0, 500.0)), FIT_ZOOM);
+    }
+
+    #[test]
+    fn zoom_step_should_travel_past_parity_but_stop_at_the_ceiling() {
+        let viewport = egui::vec2(800.0, 600.0);
+        let fitted = egui::vec2(600.0, 400.0);
+        // Native width 2400 at fit width 600: parity 4×, ceiling 16×.
+        let parity = 4.0_f32;
+        let ceiling = 16.0_f32;
+
+        // From parity, doubling lands beyond 100% without clamping…
+        let (zoom, _) = zoom_step(
+            parity,
+            egui::Vec2::ZERO,
+            2.0,
+            ceiling,
+            egui::Vec2::ZERO,
+            fitted,
+            viewport,
+        );
+        assert!((zoom - 8.0).abs() < 1e-5);
+
+        // …and the hard stop only arrives at 4× parity.
+        let (zoom, pan) = zoom_step(
+            12.0,
+            egui::Vec2::ZERO,
+            10.0,
+            ceiling,
+            egui::Vec2::ZERO,
+            fitted,
+            viewport,
+        );
+        assert!((zoom - ceiling).abs() < 1e-5);
+
+        // Zooming back out below parity still works as before.
+        let (zoom, _) = zoom_step(
+            zoom,
+            pan,
+            1.0 / 8.0,
+            ceiling,
+            egui::Vec2::ZERO,
+            fitted,
+            viewport,
+        );
+        assert!((zoom - 2.0).abs() < 1e-4);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 # Cullr
 
-Photo Mechanic-style culling for RAW photographs. Open a folder, browse embedded JPEG previews instantly, mark colors, filter. Keyboard-first.
+Photo Mechanic-style culling for RAW photographs. 
+Open a folder, browse embedded JPEG previews instantly, mark colors, filter. Keyboard-first.
 
 ![Contact sheet: virtualized grid with filter chips, live counts, color labels, zoom slider and sort](docs/screenshots/grid.png)
 
@@ -10,14 +11,10 @@ Photo Mechanic-style culling for RAW photographs. Open a folder, browse embedded
 
 *Home — open a folder or resume where you left off.*
 
-## Why
-
-Culling speed comes from embedded JPEG previews, never full RAW decode. The contact sheet is virtualized — only visible cells hold GPU textures — and every extracted preview and thumbnail is cached on disk keyed by path + mtime, so re-opening a known folder is instant.
-
 ## Features
 
 - Virtualized contact sheet: only visible cells own GPU textures (LRU cache, 512 MB budget)
-- Full-screen loupe: fit / 100% zoom toward cursor, drag to pan, neighbor prefetch
+- Full-screen loupe: wheel zoom toward cursor from fit to 400% (100% = pixel parity), drag to pan, neighbor prefetch
 - Photoshop-style zoom: `Ctrl+0` fit / `Ctrl+1` 100%, `Ctrl+=` / `Ctrl+-` steps, double-click flips under the cursor, Shift-drag marquee zoom, zoom % pill with scrubby drag
 - Lightbox (`L`): chromeless photo on black (or pure white with `W`) for an unobstructed look — from the grid or the loupe
 - Portrait auto-detect: EXIF orientation applied on display; `[` / `]` rotate manually (persisted)
@@ -56,7 +53,7 @@ cullr-ui
 cullr-ui /path/to/photos
 ```
 
-Linux-first (X11 and Wayland verified), portable anywhere Rust builds. No system library requirements beyond GPU/OpenGL drivers — SQLite is bundled.
+Linux-first (X11 and Wayland verified), portable anywhere Rust builds. No system library requirements beyond GPU/OpenGL drivers. SQLite is bundled.
 
 ## Keyboard reference
 
