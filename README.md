@@ -8,11 +8,11 @@ Open a folder, browse embedded JPEG previews instantly, mark colors and filter.
 
 ![Contact sheet: virtualized grid with filter chips, live counts, color labels, zoom slider and sort](docs/screenshots/grid.png)
 
-*Contact sheet — filter chips with live counts, zoom slider, filename sort, color labels.*
+*Contact sheet: filter chips with live counts, zoom slider, filename sort, color labels.*
 
 ![Home view: open a folder or resume a recent one](docs/screenshots/home.png)
 
-*Home — open a folder or resume where you left off.*
+*Home: open a folder or resume where you left off.*
 
 ## Features
 
